@@ -11,7 +11,7 @@ string or service-role key.
 For a given UTC date: download ONE national MRMS MESH_Max_1440min grid (24h max
 estimated hail size, ~1 km), classify into inch bands, polygonize, clip to each
 permitted state, simplify, and POST each state's result to ingest_swath. Empty
-state-days (no on-land hail >= 0.75") are skipped.
+state-days (no on-land hail >= 0.50") are skipped.
 
 This is the ONLY component that touches GRIB2 - it runs in GitHub Actions (free),
 never in Supabase or Lovable.
@@ -151,7 +151,7 @@ def process_date(date_str, states, base, anon, secret):
         except Exception as e:
             print(f"  [error] {date_iso} {st}: {e}")
     if stored == 0:
-        print(f"{date_iso}: no on-land hail >= 0.75\" in selected state(s).")
+        print(f"{date_iso}: no on-land hail >= 0.50\" in selected state(s).")
     return stored
 
 
