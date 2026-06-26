@@ -36,7 +36,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
 
-BANDS = [0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
+BANDS = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
 GRID_NORTH, GRID_WEST, GRID_RES = 55.0, -130.0, 0.01
 
 PERMITTED_STATES = {
