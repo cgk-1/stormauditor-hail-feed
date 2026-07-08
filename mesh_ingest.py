@@ -11,7 +11,7 @@ string or service-role key.
 For a given UTC date: download ONE national MRMS MESH_Max_1440min grid (24h max
 estimated hail size, ~1 km), classify into inch bands, polygonize, clip to each
 permitted state, simplify, and POST each state's result to ingest_swath. Empty
-state-days (no on-land hail >= 0.50") are skipped.
+state-days (no on-land hail >= 0.75") are skipped.
 
 This is the ONLY component that touches GRIB2 - it runs in GitHub Actions (free),
 never in Supabase or Lovable.
@@ -33,10 +33,12 @@ import pygrib
 import requests
 from rasterio.features import shapes
 from rasterio.transform import from_origin
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape, mapping, Point
+from shapely.prepared import prep
 from shapely.ops import unary_union
 
 BANDS = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
+POINT_FLOOR = 0.50   # store raw MESH cell values >= this (inches) for precise lookups
 GRID_NORTH, GRID_WEST, GRID_RES = 55.0, -130.0, 0.01
 
 PERMITTED_STATES = {
@@ -65,6 +67,11 @@ def load_state_geom(name):
 
 def fetch_mesh(date_str):
     y, m, d = date_str[:4], date_str[4:6], date_str[6:]
+    # UTC calendar day (23:30Z 24h-max file). Kept deliberately: the existing
+    # 2-year dataset was built on this convention and validates well against
+    # commercial tools; changing to 06Z mid-table would date storms
+    # inconsistently. The 72-hour date-of-loss window absorbs most
+    # day-convention differences when comparing against 6am-6am reports.
     url = (f"https://mtarchive.geol.iastate.edu/{y}/{m}/{d}/mrms/ncep/"
            f"MESH_Max_1440min/MESH_Max_1440min_00.50_{date_str}-233000.grib2.gz")
     try:
@@ -116,6 +123,35 @@ def build_bands(cls, inches, geom):
     return out, max_in
 
 
+def extract_points(inches, geom, floor=POINT_FLOOR):
+    """Return raw MESH cell values (inches) inside the state as {lon,lat,v} list."""
+    minx, miny, maxx, maxy = geom.bounds
+    c0 = int((minx - GRID_WEST) / GRID_RES); r0 = int((GRID_NORTH - maxy) / GRID_RES)
+    c1 = int((maxx - GRID_WEST) / GRID_RES) + 1; r1 = int((GRID_NORTH - miny) / GRID_RES) + 1
+    sub = inches[r0:r1, c0:c1]
+    ys, xs = np.where(sub >= floor)
+    pg = prep(geom); out = []
+    for yy, xx in zip(ys.tolist(), xs.tolist()):
+        lon = GRID_WEST + (c0 + xx) * GRID_RES + GRID_RES / 2
+        lat = GRID_NORTH - (r0 + yy) * GRID_RES - GRID_RES / 2
+        if pg.contains(Point(lon, lat)):
+            out.append({"lon": round(lon, 3), "lat": round(lat, 3),
+                        "v": round(float(sub[yy, xx]), 2)})
+    return out
+
+
+def push_points(base, anon, secret, state, date_iso, points):
+    r = requests.post(
+        f"{base}/rest/v1/rpc/ingest_points",
+        headers={"apikey": anon, "Authorization": f"Bearer {anon}",
+                 "Content-Type": "application/json"},
+        data=json.dumps({"p_secret": secret, "p_state": state,
+                         "p_date": date_iso, "p_points": points}),
+        timeout=60)
+    if r.status_code >= 300:
+        raise RuntimeError(f"points {r.status_code}: {r.text[:200]}")
+
+
 def push(base, anon, secret, state, date_iso, bands, max_in):
     r = requests.post(
         f"{base}/rest/v1/rpc/ingest_swath",
@@ -142,16 +178,22 @@ def process_date(date_str, states, base, anon, secret):
             continue
         try:
             geom = load_state_geom(st)
-            bands, max_in = build_bands(cls, inches, geom)
+            bands, _bbox_max = build_bands(cls, inches, geom)
             if not bands:
                 continue
+            pts = extract_points(inches, geom)
+            if not pts:
+                continue   # bands existed but no in-state cells >= floor
+            # state max = largest exact in-state cell value (never bbox/offshore)
+            max_in = max(p["v"] for p in pts)
             push(base, anon, secret, st, date_iso, bands, max_in)
+            push_points(base, anon, secret, st, date_iso, pts)
             stored += 1
             print(f"  {date_iso}  {st:16s} pushed {len(bands)} band(s), max {max_in}\"")
         except Exception as e:
             print(f"  [error] {date_iso} {st}: {e}")
     if stored == 0:
-        print(f"{date_iso}: no on-land hail >= 0.50\" in selected state(s).")
+        print(f"{date_iso}: no on-land hail >= 0.75\" in selected state(s).")
     return stored
 
 
