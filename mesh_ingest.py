@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
 """
-MRMS MESH -> Supabase hail-swath ingester for stormauditor.com (Lovable Cloud).
+MRMS MESH -> Supabase hail ingester for stormauditor.com  (v3: local-clock days)
 
-Works WITHOUT a direct database URL. It pushes finished swath polygons into your
-Lovable-managed Supabase by calling a locked SQL function (`ingest_swath`) over
-the public REST API, authenticated with your anon key + a shared secret. This is
-required because Lovable Cloud does not expose the direct Postgres connection
-string or service-role key.
+DAY CONVENTION (v3): each "day" is the LOCAL CALENDAR DAY (midnight-to-midnight,
+local clock time, DST-aware) of the state's dominant timezone. For each local
+date D and timezone group, we fetch the MESH_Max_1440min file whose 24-hour
+rolling window ENDS at local midnight ending D (i.e., 00:00 local on D+1,
+converted to UTC, rounded to the archive's 30-minute file cadence). This makes
+StormAuditor dates match a homeowner's clock and commercial reports.
 
-For a given UTC date: download ONE national MRMS MESH_Max_1440min grid (24h max
-estimated hail size, ~1 km), classify into inch bands, polygonize, clip to each
-permitted state, simplify, and POST each state's result to ingest_swath. Empty
-state-days (no on-land hail >= 0.75") are skipped.
+TIMESTAMPS (v3): every state-day now stores window_end_utc, the exact UTC end
+of the 24h window the values cover (window = (end-24h, end]). This makes any
+future date-convention change a pure database relabel, never a re-download.
 
-This is the ONLY component that touches GRIB2 - it runs in GitHub Actions (free),
-never in Supabase or Lovable.
+Also retained from v2: 0.50" capture floor, exact point values, in-state max,
+MultiPolygon coercion, complete state boundaries, retries, chunked point writes.
+Retention: 3 years, purged incrementally by purge_old_hail() on every run.
 
-Env vars required (set as GitHub repo secrets):
-  SUPABASE_URL        e.g. https://abcdxyz.supabase.co
-  SUPABASE_ANON_KEY   the anon / publishable key from your Lovable app
-  INGEST_SECRET       a random password you also store in the app_config table
-Optional:
-  INGEST_DATE         YYYYMMDD (default: yesterday UTC)
-  STATES              comma list of state names (default: all permitted)
+Env (GitHub secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
+Optional: INGEST_DATE (local YYYYMMDD, single/comma/range a:b), STATES,
+          STATE_PAUSE (sec between states, default 0.4)
 
 Deps: pygrib numpy rasterio shapely requests
 """
-import os, gzip, json, datetime as dt
+import os, gzip, json, time, datetime as dt
+from zoneinfo import ZoneInfo
 import urllib.request
 import numpy as np
 import pygrib
@@ -38,18 +36,30 @@ from shapely.prepared import prep
 from shapely.ops import unary_union
 
 BANDS = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
-POINT_FLOOR = 0.50   # store raw MESH cell values >= this (inches) for precise lookups
+POINT_FLOOR = 0.50
 GRID_NORTH, GRID_WEST, GRID_RES = 55.0, -130.0, 0.01
+UTC = dt.timezone.utc
 
-PERMITTED_STATES = {
-    "Alabama","Arizona","Arkansas","California","Colorado","Connecticut","Delaware",
-    "Florida","Georgia","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky",
-    "Louisiana","Maine","Maryland","Massachusetts","Michigan","Minnesota","Mississippi",
-    "Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey","New Mexico",
-    "New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania",
-    "Rhode Island","South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont",
-    "Virginia","Washington","West Virginia","Wisconsin","Wyoming",
+# Dominant IANA timezone per state (approved approximation: one zone per state).
+STATE_TZ = {
+ "Alabama":"America/Chicago","Arizona":"America/Phoenix","Arkansas":"America/Chicago",
+ "California":"America/Los_Angeles","Colorado":"America/Denver","Connecticut":"America/New_York",
+ "Delaware":"America/New_York","Florida":"America/New_York","Georgia":"America/New_York",
+ "Idaho":"America/Boise","Illinois":"America/Chicago","Indiana":"America/Indiana/Indianapolis",
+ "Iowa":"America/Chicago","Kansas":"America/Chicago","Kentucky":"America/New_York",
+ "Louisiana":"America/Chicago","Maine":"America/New_York","Maryland":"America/New_York",
+ "Massachusetts":"America/New_York","Michigan":"America/Detroit","Minnesota":"America/Chicago",
+ "Mississippi":"America/Chicago","Missouri":"America/Chicago","Montana":"America/Denver",
+ "Nebraska":"America/Chicago","Nevada":"America/Los_Angeles","New Hampshire":"America/New_York",
+ "New Jersey":"America/New_York","New Mexico":"America/Denver","New York":"America/New_York",
+ "North Carolina":"America/New_York","North Dakota":"America/Chicago","Ohio":"America/New_York",
+ "Oklahoma":"America/Chicago","Oregon":"America/Los_Angeles","Pennsylvania":"America/New_York",
+ "Rhode Island":"America/New_York","South Carolina":"America/New_York","South Dakota":"America/Chicago",
+ "Tennessee":"America/Chicago","Texas":"America/Chicago","Utah":"America/Denver",
+ "Vermont":"America/New_York","Virginia":"America/New_York","Washington":"America/Los_Angeles",
+ "West Virginia":"America/New_York","Wisconsin":"America/Chicago","Wyoming":"America/Denver",
 }
+PERMITTED_STATES = set(STATE_TZ)
 
 BOUNDARY_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 _CACHE = {}
@@ -70,26 +80,43 @@ def load_state_geom(name):
     return geom
 
 
-def fetch_mesh(date_str):
-    y, m, d = date_str[:4], date_str[4:6], date_str[6:]
-    # UTC calendar day (23:30Z 24h-max file). Kept deliberately: the existing
-    # 2-year dataset was built on this convention and validates well against
-    # commercial tools; changing to 06Z mid-table would date storms
-    # inconsistently. The 72-hour date-of-loss window absorbs most
-    # day-convention differences when comparing against 6am-6am reports.
-    url = (f"https://mtarchive.geol.iastate.edu/{y}/{m}/{d}/mrms/ncep/"
-           f"MESH_Max_1440min/MESH_Max_1440min_00.50_{date_str}-233000.grib2.gz")
-    try:
-        raw = urllib.request.urlopen(url, timeout=120).read()
-    except Exception as e:
-        print(f"  [warn] could not fetch {url}: {e}")
-        return None
-    with open("/tmp/_mesh.grib2", "wb") as fh:
-        fh.write(gzip.decompress(raw))
-    g = pygrib.open("/tmp/_mesh.grib2")
-    vals = g[1].values
-    g.close()
-    return np.asarray(vals)
+def window_end_utc(state, local_date_str):
+    """UTC datetime of local midnight ENDING local date D (= 00:00 local on D+1),
+    DST-aware, rounded to the archive's 30-minute file cadence."""
+    tz = ZoneInfo(STATE_TZ[state])
+    y, m, d = int(local_date_str[:4]), int(local_date_str[4:6]), int(local_date_str[6:])
+    end = (dt.datetime(y, m, d, tzinfo=tz) + dt.timedelta(days=1)).astimezone(UTC)
+    # round to nearest 30 min (files exist at :00 and :30)
+    if end.minute < 15:
+        end = end.replace(minute=0)
+    elif end.minute < 45:
+        end = end.replace(minute=30)
+    else:
+        end = (end + dt.timedelta(hours=1)).replace(minute=0)
+    return end.replace(second=0, microsecond=0)
+
+
+def fetch_mesh_at(anchor_utc):
+    """Download the MESH_Max_1440min file whose window ends at anchor_utc.
+    Retries; returns mm array or None."""
+    ds = anchor_utc.strftime("%Y%m%d")
+    ts = anchor_utc.strftime("%H%M%S")
+    url = (f"https://mtarchive.geol.iastate.edu/{ds[:4]}/{ds[4:6]}/{ds[6:]}/mrms/ncep/"
+           f"MESH_Max_1440min/MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
+    for attempt in range(4):
+        try:
+            raw = urllib.request.urlopen(url, timeout=120).read()
+            with open("/tmp/_mesh.grib2", "wb") as fh:
+                fh.write(gzip.decompress(raw))
+            g = pygrib.open("/tmp/_mesh.grib2")
+            vals = np.asarray(g[1].values)
+            g.close()
+            return vals
+        except Exception as e:
+            if attempt == 3:
+                print(f"  [warn] fetch failed {url}: {e}")
+                return None
+            time.sleep(2 * (attempt + 1))
 
 
 def classify(vals_mm):
@@ -109,10 +136,10 @@ def _window(arr, geom):
     return sub, t
 
 
-def build_bands(cls, inches, geom):
+def build_bands(cls, geom):
     sub, t = _window(cls, geom)
     if int((sub > 0).sum()) == 0:
-        return [], 0.0
+        return []
     band_polys = {}
     for geo, val in shapes(sub.astype("int16"), transform=t):
         val = int(val)
@@ -124,20 +151,17 @@ def build_bands(cls, inches, geom):
         if merged.is_empty:
             continue
         if merged.geom_type == "Polygon":
-            merged = MultiPolygon([merged])          # column is MultiPolygon-typed
+            merged = MultiPolygon([merged])
         elif merged.geom_type != "MultiPolygon":
             polys = [g for g in merged.geoms if isinstance(g, Polygon)] if hasattr(merged, "geoms") else []
             if not polys:
                 continue
             merged = MultiPolygon(polys)
         out.append({"band": val, "min_in": BANDS[val - 1], "geom": mapping(merged)})
-    sub_in, _ = _window(inches, geom)
-    max_in = round(float(sub_in.max()), 2) if sub_in.size else 0.0
-    return out, max_in
+    return out
 
 
 def extract_points(inches, geom, floor=POINT_FLOOR):
-    """Return raw MESH cell values (inches) inside the state as {lon,lat,v} list."""
     minx, miny, maxx, maxy = geom.bounds
     c0 = int((minx - GRID_WEST) / GRID_RES); r0 = int((GRID_NORTH - maxy) / GRID_RES)
     c1 = int((maxx - GRID_WEST) / GRID_RES) + 1; r1 = int((GRID_NORTH - miny) / GRID_RES) + 1
@@ -153,79 +177,106 @@ def extract_points(inches, geom, floor=POINT_FLOOR):
     return out
 
 
-def push_points(base, anon, secret, state, date_iso, points):
-    r = requests.post(
-        f"{base}/rest/v1/rpc/ingest_points",
-        headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                 "Content-Type": "application/json"},
-        data=json.dumps({"p_secret": secret, "p_state": state,
-                         "p_date": date_iso, "p_points": points}),
-        timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"points {r.status_code}: {r.text[:200]}")
+def rpc(base, anon, name, payload):
+    last = ""
+    for attempt in range(4):
+        try:
+            r = requests.post(f"{base}/rest/v1/rpc/{name}",
+                              headers={"apikey": anon, "Authorization": f"Bearer {anon}",
+                                       "Content-Type": "application/json"},
+                              data=json.dumps(payload), timeout=120)
+            if r.status_code < 300:
+                return r
+            last = f"{name} {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last = f"{name} exception: {e}"
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(last)
 
 
-def push(base, anon, secret, state, date_iso, bands, max_in):
-    r = requests.post(
-        f"{base}/rest/v1/rpc/ingest_swath",
-        headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                 "Content-Type": "application/json"},
-        data=json.dumps({"p_secret": secret, "p_state": state, "p_date": date_iso,
-                         "p_max_in": max_in, "p_features": bands}),
-        timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"{r.status_code}: {r.text[:300]}")
-
-
-def process_date(date_str, states, base, anon, secret):
-    date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-    vals = fetch_mesh(date_str)
-    if vals is None:
-        print(f"{date_iso}: no MESH grid available; skipping.")
-        return 0
-    cls, inches = classify(vals)
-    stored = 0
+def process_local_date(local_date, states, base, anon, secret, pause=0.4):
+    """Ingest one LOCAL calendar date for the given states. States are grouped
+    by their UTC anchor so each distinct anchor file is downloaded once
+    (typically 4-5 downloads for all 48 states)."""
+    date_iso = f"{local_date[:4]}-{local_date[4:6]}-{local_date[6:]}"
+    groups = {}
     for st in states:
         if st not in PERMITTED_STATES:
-            print(f"  [skip] {st} not permitted (outside MRMS coverage)")
+            print(f"  [skip] {st} not permitted")
             continue
-        try:
-            geom = load_state_geom(st)
-            bands, _bbox_max = build_bands(cls, inches, geom)
-            if not bands:
-                continue
-            pts = extract_points(inches, geom)
-            if not pts:
-                continue   # bands existed but no in-state cells >= floor
-            # state max = largest exact in-state cell value (never bbox/offshore)
-            max_in = max(p["v"] for p in pts)
-            push(base, anon, secret, st, date_iso, bands, max_in)
-            push_points(base, anon, secret, st, date_iso, pts)
-            stored += 1
-            print(f"  {date_iso}  {st:16s} pushed {len(bands)} band(s), max {max_in}\"")
-        except Exception as e:
-            print(f"  [error] {date_iso} {st}: {e}")
+        groups.setdefault(window_end_utc(st, local_date), []).append(st)
+
+    stored = 0
+    for anchor, group_states in sorted(groups.items()):
+        vals = fetch_mesh_at(anchor)
+        if vals is None:
+            print(f"  {date_iso}: no MESH file for anchor {anchor.isoformat()}; "
+                  f"skipping {len(group_states)} state(s)")
+            continue
+        cls, inches = classify(vals)
+        wend = anchor.isoformat()
+        for st in group_states:
+            try:
+                geom = load_state_geom(st)
+                bands = build_bands(cls, geom)
+                if not bands:
+                    continue
+                pts = extract_points(inches, geom)
+                if not pts:
+                    continue
+                max_in = max(p["v"] for p in pts)
+                rpc(base, anon, "ingest_swath",
+                    {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                     "p_max_in": max_in, "p_features": bands, "p_window_end": wend})
+                for i in range(0, len(pts), 4000):
+                    rpc(base, anon, "ingest_points",
+                        {"p_secret": secret, "p_state": st, "p_date": date_iso,
+                         "p_points": pts[i:i+4000], "p_append": i > 0,
+                         "p_window_end": wend})
+                stored += 1
+                print(f"  {date_iso}  {st:16s} max {max_in}\" ({len(bands)} band(s), "
+                      f"{len(pts)} pts, window end {wend})")
+                time.sleep(pause)
+            except Exception as e:
+                print(f"  [error] {date_iso} {st}: {e}")
     if stored == 0:
-        print(f"{date_iso}: no on-land hail >= 0.75\" in selected state(s).")
+        print(f"{date_iso}: no on-land hail >= {POINT_FLOOR}\" in selected state(s).")
     return stored
 
 
 def main():
     raw = os.environ.get("INGEST_DATE") or \
-        (dt.datetime.utcnow().date() - dt.timedelta(days=1)).strftime("%Y%m%d")
-    # INGEST_DATE may be a single date or a comma-separated list (for backfill)
-    dates = [d.strip() for d in raw.split(",") if d.strip()]
+        (dt.datetime.now(UTC).date() - dt.timedelta(days=1)).strftime("%Y%m%d")
+    dates = []
+    for tok in [d.strip() for d in raw.split(",") if d.strip()]:
+        if ":" in tok:
+            a, b = tok.split(":")
+            d0 = dt.datetime.strptime(a, "%Y%m%d").date()
+            d1 = dt.datetime.strptime(b, "%Y%m%d").date()
+            cur = d0
+            while cur <= d1:
+                dates.append(cur.strftime("%Y%m%d")); cur += dt.timedelta(days=1)
+        else:
+            dates.append(tok)
+
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
     secret = os.environ["INGEST_SECRET"]
+    pause = float(os.environ.get("STATE_PAUSE", "0.4") or "0.4")
     states_env = os.environ.get("STATES")
     states = ([s.strip() for s in states_env.split(",")] if states_env
               else sorted(PERMITTED_STATES))
 
-    print(f"Ingesting {len(dates)} date(s) across {len(states)} state(s)")
+    print(f"MESH ingest v3 (local-clock days): {len(dates)} date(s), {len(states)} state(s)")
     total = 0
     for d in dates:
-        total += process_date(d, states, base, anon, secret)
+        total += process_local_date(d, states, base, anon, secret, pause)
+
+    try:
+        rpc(base, anon, "purge_old_hail", {"p_secret": secret})
+        print("Rolling purge: removed hail data older than 3 years.")
+    except Exception as e:
+        print(f"[warn] purge failed: {e}")
     print(f"Done. {total} state-day(s) written across {len(dates)} date(s).")
 
 
