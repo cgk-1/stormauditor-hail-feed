@@ -2,7 +2,7 @@ name: hail-ingest
 
 on:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "30 9 * * *"
   workflow_dispatch:
     inputs:
       date:
