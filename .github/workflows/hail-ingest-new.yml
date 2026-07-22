@@ -1,0 +1,35 @@
+name: hail-ingest-newdb
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Back-date to ingest (YYYYMMDD). Blank = yesterday."
+        required: false
+      states:
+        description: "Comma list of states. Blank = all permitted."
+        required: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
+      - name: Python deps
+        run: pip install pygrib numpy rasterio shapely requests
+      - name: Run ingester
+        env:
+          SUPABASE_URL:      https://aozjsfjemobuzqrhxcxy.supabase.co
+          SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFvempzZmplbW9idXpxcmh4Y3h5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2NzMyODIsImV4cCI6MjEwMDI0OTI4Mn0.gYwwzMcT4VCuTyWHNXlm8viyeGOsv7isfNgegYAmcV8
+          INGEST_SECRET:     ${{ secrets.INGEST_SECRET_NEW }}
+          INGEST_DATE:       ${{ github.event.inputs.date }}
+          STATES:            ${{ github.event.inputs.states }}
+        run: python mesh_ingest.py
