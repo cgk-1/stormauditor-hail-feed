@@ -125,6 +125,24 @@ def classify(vals_mm):
     # (hail spikes / three-body scatter). Zero those cells so neither bands
     # nor points nor the day max can be poisoned.
     inches = np.where(inches <= 8.0, inches, 0.0)
+    # Spatial-support despeckle for giant hail: a real >=3in core always sits
+    # inside a broader swath of smaller hail. Isolated >=3in cells with fewer
+    # than 5 supporting cells (>=0.75in) in their 5x5 neighborhood are radar
+    # artifacts (cool-season bright-band / clutter) — zero them. Confirmed
+    # empirically: 59 such state-days in history, all with ZERO ground reports.
+    big = inches >= 3.0
+    if big.any():
+        support = (inches >= 0.75).astype(np.int16)
+        # 5x5 neighborhood sum via shifted adds (no scipy dependency)
+        nb = np.zeros_like(support)
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                if dy == 0 and dx == 0:
+                    continue
+                nb[max(0,dy):support.shape[0]+min(0,dy) or None,
+                   max(0,dx):support.shape[1]+min(0,dx) or None] +=                   support[max(0,-dy):support.shape[0]+min(0,-dy) or None,
+                          max(0,-dx):support.shape[1]+min(0,-dx) or None]
+        inches = np.where(big & (nb < 5), 0.0, inches)
     cls = np.zeros(inches.shape, dtype=np.int16)
     for i, b in enumerate(BANDS, start=1):
         cls[inches >= b] = i
