@@ -121,6 +121,10 @@ def fetch_mesh_at(anchor_utc):
 
 def classify(vals_mm):
     inches = np.where(vals_mm >= 0, vals_mm / 25.4, 0.0)
+    # Radar-artifact ceiling: MESH above 8 inches is physically impossible
+    # (hail spikes / three-body scatter). Zero those cells so neither bands
+    # nor points nor the day max can be poisoned.
+    inches = np.where(inches <= 8.0, inches, 0.0)
     cls = np.zeros(inches.shape, dtype=np.int16)
     for i, b in enumerate(BANDS, start=1):
         cls[inches >= b] = i
@@ -166,7 +170,10 @@ def extract_points(inches, geom, floor=POINT_FLOOR):
     c0 = int((minx - GRID_WEST) / GRID_RES); r0 = int((GRID_NORTH - maxy) / GRID_RES)
     c1 = int((maxx - GRID_WEST) / GRID_RES) + 1; r1 = int((GRID_NORTH - miny) / GRID_RES) + 1
     sub = inches[r0:r1, c0:c1]
-    ys, xs = np.where(sub >= floor)
+    # Ceiling: MESH cells above 8 inches are radar artifacts (hail spikes /
+    # three-body scatter) — the world-record hailstone is 8". Discard them so
+    # they can't poison swaths, points, or per-day maxima.
+    ys, xs = np.where((sub >= floor) & (sub <= 8.0))
     pg = prep(geom); out = []
     for yy, xx in zip(ys.tolist(), xs.tolist()):
         lon = GRID_WEST + (c0 + xx) * GRID_RES + GRID_RES / 2
