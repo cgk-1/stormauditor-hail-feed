@@ -43,7 +43,7 @@ def main():
     start = dt.datetime.strptime(os.environ["START_DATE"], "%Y%m%d").date() \
             if os.environ.get("START_DATE") else today - dt.timedelta(days=1095)  # 3 years
 
-    cur = rpc(base, anon, "backfill_get", {"p_key": "hail"})
+    cur = rpc(base, anon, "backfill_get", {"p_key": "hail", "p_secret": secret})
     cursor = dt.datetime.strptime(cur, "%Y-%m-%d").date() if cur else end + dt.timedelta(days=1)
 
     states = sorted(m.PERMITTED_STATES)
@@ -64,7 +64,7 @@ def main():
             print(f"  {day}: {n} state-day(s) written  [{int(time.time()-t0)}s elapsed]")
         except Exception as e:
             print(f"  [error] {day}: {e} -- advancing past it")
-        rpc(base, anon, "backfill_set", {"p_key": "hail", "p_value": day.strftime("%Y-%m-%d")})
+        rpc(base, anon, "backfill_set", {"p_key": "hail", "p_value": day.strftime("%Y-%m-%d"), "p_secret": secret})
         cursor = day
         done += 1
 
