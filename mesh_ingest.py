@@ -362,13 +362,19 @@ def main():
         # miss: the 09:00 run found no MESH files yet, exited "success", and
         # nothing ever retried). A genuinely quiet national day is re-checked
         # harmlessly (run costs ~1 min and writes nothing).
+        # Load discipline (2026-08-27): a day is (re)ingested ONLY while the DB
+        # has zero states for it — so the morning run does the real work and
+        # the afternoon self-heal pass costs three count queries (~seconds)
+        # unless something actually failed. No duplicate daily rewrites.
         today = dt.datetime.now(UTC).date()
-        dates.append((today - dt.timedelta(days=1)).strftime("%Y%m%d"))
-        for back in (2, 3):
+        for back in (1, 2, 3):
             d = today - dt.timedelta(days=back)
             if db_day_states(base, anon, d.strftime("%Y-%m-%d")) == 0:
-                print(f"[self-heal] {d} has zero ingested states — re-running that date")
+                if back > 1:
+                    print(f"[self-heal] {d} has zero ingested states — re-running that date")
                 dates.append(d.strftime("%Y%m%d"))
+        if not dates:
+            print("All recent dates already ingested — nothing to do.")
     states_env = os.environ.get("STATES")
     states = ([s.strip() for s in states_env.split(",")] if states_env
               else sorted(PERMITTED_STATES))
