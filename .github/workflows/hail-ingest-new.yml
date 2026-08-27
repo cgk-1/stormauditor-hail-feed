@@ -3,6 +3,10 @@ name: hail-ingest-newdb
 on:
   schedule:
     - cron: "0 9 * * *"
+    # Second daily pass (2026-08-27): self-heal sweep — re-runs any of the
+    # last 3 days that ingested zero states (late MESH archive files or a
+    # skipped/failed morning run, e.g. the 2026-08-26 nationwide miss).
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       date:
