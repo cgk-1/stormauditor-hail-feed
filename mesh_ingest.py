@@ -61,6 +61,28 @@ STATE_TZ = {
 }
 PERMITTED_STATES = set(STATE_TZ)
 
+STATE_ABBR = {
+ "Alabama":"AL","Arizona":"AZ","Arkansas":"AR","California":"CA","Colorado":"CO",
+ "Connecticut":"CT","Delaware":"DE","Florida":"FL","Georgia":"GA","Idaho":"ID",
+ "Illinois":"IL","Indiana":"IN","Iowa":"IA","Kansas":"KS","Kentucky":"KY",
+ "Louisiana":"LA","Maine":"ME","Maryland":"MD","Massachusetts":"MA","Michigan":"MI",
+ "Minnesota":"MN","Mississippi":"MS","Missouri":"MO","Montana":"MT","Nebraska":"NE",
+ "Nevada":"NV","New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM","New York":"NY",
+ "North Carolina":"NC","North Dakota":"ND","Ohio":"OH","Oklahoma":"OK","Oregon":"OR",
+ "Pennsylvania":"PA","Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD",
+ "Tennessee":"TN","Texas":"TX","Utah":"UT","Vermont":"VT","Virginia":"VA",
+ "Washington":"WA","West Virginia":"WV","Wisconsin":"WI","Wyoming":"WY",
+}
+# Months where MESH bright-band / cool-season false positives dominate the
+# false-alarm budget (verified 2026-08-27: e.g. Maine showed ~25 "hail days"
+# EVERY month incl. January; New York had 389 cold-month days with no ground
+# report, avg 1.5in). The guard below drops a cold-month state-day ONLY when
+# BOTH lines of evidence say artifact: zero in-state hail LSRs for the local
+# day AND the statewide max temperature stayed below 45F. Any fetch failure
+# keeps the day (fail-open) so real hail in rural / under-spotted areas is
+# never dropped just for lack of a report.
+COLD_MONTHS = {11, 12, 1, 2, 3}
+
 BOUNDARY_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
 _CACHE = {}
 _ALL_STATES_CACHE = None
@@ -202,6 +224,46 @@ def extract_points(inches, geom, floor=POINT_FLOOR):
     return out
 
 
+def cold_season_check(state, date_iso, anchor_utc):
+    """(skip?, reason). Cold-month artifact guard — see COLD_MONTHS note."""
+    ab = STATE_ABBR.get(state)
+    if not ab:
+        return (False, "")
+    try:
+        sts = (anchor_utc - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%MZ")
+        ets = anchor_utc.strftime("%Y-%m-%dT%H:%MZ")
+        url = (f"https://mesonet.agron.iastate.edu/geojson/lsr.py?sts={sts}&ets={ets}"
+               f"&states={ab}&type=H")
+        gj = json.loads(urllib.request.urlopen(url, timeout=60).read())
+        if gj.get("features"):
+            return (False, "")   # ground-truth hail exists — always keep
+    except Exception:
+        return (False, "")       # can't check reports — keep the day
+    try:
+        url = f"https://mesonet.agron.iastate.edu/api/1/daily.json?network={ab}_ASOS&date={date_iso}"
+        data = json.loads(urllib.request.urlopen(url, timeout=60).read()).get("data", [])
+        temps = [r.get("max_tmpf") for r in data if isinstance(r.get("max_tmpf"), (int, float))]
+        if temps and max(temps) < 45.0:
+            return (True, f"no hail LSR + statewide max temp {max(temps):.0f}F < 45F (bright-band signature)")
+    except Exception:
+        pass
+    return (False, "")
+
+
+def db_day_states(base, anon, date_iso):
+    """How many states already have hail rows for date_iso (-1 = unknown)."""
+    try:
+        r = requests.get(f"{base}/rest/v1/hail_days",
+                         params={"valid_date": f"eq.{date_iso}", "select": "state"},
+                         headers={"apikey": anon, "Authorization": f"Bearer {anon}",
+                                  "Prefer": "count=exact", "Range": "0-0"},
+                         timeout=30)
+        cr = r.headers.get("Content-Range", "")
+        return int(cr.split("/")[-1]) if "/" in cr else -1
+    except Exception:
+        return -1
+
+
 def rpc(base, anon, name, payload):
     last = ""
     for attempt in range(4):
@@ -250,6 +312,11 @@ def process_local_date(local_date, states, base, anon, secret, pause=0.4):
                 if not pts:
                     continue
                 max_in = max(p["v"] for p in pts)
+                if int(date_iso[5:7]) in COLD_MONTHS:
+                    skip, why = cold_season_check(st, date_iso, anchor)
+                    if skip:
+                        print(f"  {date_iso}  {st:16s} [cold-season artifact guard] skipped: {why}")
+                        continue
                 rpc(base, anon, "ingest_swath",
                     {"p_secret": secret, "p_state": st, "p_date": date_iso,
                      "p_max_in": max_in, "p_features": bands, "p_window_end": wend})
@@ -270,24 +337,38 @@ def process_local_date(local_date, states, base, anon, secret, pause=0.4):
 
 
 def main():
-    raw = os.environ.get("INGEST_DATE") or \
-        (dt.datetime.now(UTC).date() - dt.timedelta(days=1)).strftime("%Y%m%d")
-    dates = []
-    for tok in [d.strip() for d in raw.split(",") if d.strip()]:
-        if ":" in tok:
-            a, b = tok.split(":")
-            d0 = dt.datetime.strptime(a, "%Y%m%d").date()
-            d1 = dt.datetime.strptime(b, "%Y%m%d").date()
-            cur = d0
-            while cur <= d1:
-                dates.append(cur.strftime("%Y%m%d")); cur += dt.timedelta(days=1)
-        else:
-            dates.append(tok)
-
     base = os.environ["SUPABASE_URL"].rstrip("/")
     anon = os.environ["SUPABASE_ANON_KEY"]
     secret = os.environ["INGEST_SECRET"]
     pause = float(os.environ.get("STATE_PAUSE", "0.4") or "0.4")
+
+    raw = os.environ.get("INGEST_DATE")
+    dates = []
+    if raw:
+        for tok in [d.strip() for d in raw.split(",") if d.strip()]:
+            if ":" in tok:
+                a, b = tok.split(":")
+                d0 = dt.datetime.strptime(a, "%Y%m%d").date()
+                d1 = dt.datetime.strptime(b, "%Y%m%d").date()
+                cur = d0
+                while cur <= d1:
+                    dates.append(cur.strftime("%Y%m%d")); cur += dt.timedelta(days=1)
+            else:
+                dates.append(tok)
+    else:
+        # Scheduled run: yesterday, PLUS SELF-HEAL (2026-08-27): re-ingest any
+        # of the 2 days before that with ZERO ingested states — catches late
+        # archive files and skipped Actions runs (the 2026-08-26 nationwide
+        # miss: the 09:00 run found no MESH files yet, exited "success", and
+        # nothing ever retried). A genuinely quiet national day is re-checked
+        # harmlessly (run costs ~1 min and writes nothing).
+        today = dt.datetime.now(UTC).date()
+        dates.append((today - dt.timedelta(days=1)).strftime("%Y%m%d"))
+        for back in (2, 3):
+            d = today - dt.timedelta(days=back)
+            if db_day_states(base, anon, d.strftime("%Y-%m-%d")) == 0:
+                print(f"[self-heal] {d} has zero ingested states — re-running that date")
+                dates.append(d.strftime("%Y%m%d"))
     states_env = os.environ.get("STATES")
     states = ([s.strip() for s in states_env.split(",")] if states_env
               else sorted(PERMITTED_STATES))
