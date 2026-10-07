@@ -10,10 +10,13 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Back-date to ingest (YYYYMMDD). Blank = yesterday."
+        description: "Local date(s): YYYY-MM-DD, YYYYMMDD, START..END or a:b, comma lists. Blank = yesterday (+ self-heal)."
         required: false
       states:
         description: "Comma list of states. Blank = all permitted."
+        required: false
+      dry_run:
+        description: "1 = compute everything, write nothing (payload md5 + row counts in the summary/artifact)."
         required: false
 
 # One run at a time; a second trigger queues behind the first (never cancels it).
@@ -30,7 +33,7 @@ jobs:
       - name: System deps
         run: sudo apt-get update && sudo apt-get install -y libeccodes-dev
       - name: Python deps
-        run: pip install pygrib numpy rasterio shapely requests
+        run: pip install -r requirements.txt
       - name: Run ingester
         env:
           SUPABASE_URL:      https://aozjsfjemobuzqrhxcxy.supabase.co
@@ -38,4 +41,14 @@ jobs:
           INGEST_SECRET:     ${{ secrets.INGEST_SECRET_NEW }}
           INGEST_DATE:       ${{ github.event.inputs.date }}
           STATES:            ${{ github.event.inputs.states }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          FEED_OUT_DIR:      feed-out
         run: python mesh_ingest.py
+      - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-out-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: feed-out
+          if-no-files-found: ignore
+          retention-days: 30

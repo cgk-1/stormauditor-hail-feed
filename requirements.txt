@@ -1,0 +1,21 @@
+# Exact pins (Archive Phase 5 Stage 1, 2026-10-07). These are the versions pip
+# resolved for Python 3.11 on the ubuntu-24.04 runner for every nightly up to
+# 2026-10-06 (all releases predate that run). Change only deliberately: a new
+# numpy/pygrib/shapely/scipy can change ingested values.
+affine==3.0.1
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+click-plugins==1.1.1.2
+click==8.5.0
+cligj==0.7.2
+idna==3.20
+numpy==2.4.6
+packaging==26.3
+pygrib==2.1.8
+pyparsing==3.3.3
+pyproj==3.7.2
+rasterio==1.4.4
+requests==2.34.2
+shapely==2.1.2
+urllib3==2.8.0

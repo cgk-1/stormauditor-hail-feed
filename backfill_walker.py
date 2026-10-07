@@ -4,38 +4,28 @@ Timeout-proof self-walking backfill for HAIL (v3 local-clock days).
 
 Walks BACKWARD from yesterday to 3 years ago, one LOCAL date at a time, against
 a wall-clock budget (default 100 min; job limit 115). Progress is saved to
-Supabase after EVERY date via backfill_get/set (key='hail'), so nothing is ever
-lost and the next scheduled run resumes exactly where the last stopped.
+Supabase after EVERY COMPLETED date via backfill_get/set (key='hail'), so the
+next scheduled run resumes exactly where the last stopped.
 Each date = ~4 anchor-file downloads covering all 48 states.
 
-As it walks, it overwrites each state-day with correctly-dated v3 data, so the
-old UTC-convention history is progressively replaced newest-first.
+2026-10-07 (Archive Phase 5, Stage 1): the walker STOPS on the first date that
+did not ingest completely (missing/invalid upstream file, a failed state) and
+does NOT move the cursor past it - it used to log the error and advance, which
+left permanent silent holes. The run exits non-zero; fix the cause (or record
+the date as a known gap) and the next run retries the same date.
+This workflow is disabled (Connor); this change only matters if it is re-enabled.
 
 Env: SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
-Optional: TIME_BUDGET_MIN (default 100), START_DATE/END_DATE (YYYYMMDD)
+Optional: TIME_BUDGET_MIN (default 100), START_DATE/END_DATE (YYYYMMDD), DRY_RUN
 """
-import os, json, time, datetime as dt
-import requests
+import os, time, datetime as dt
+import feedguard as fg
 import mesh_ingest as m
 
 
-def rpc(base, anon, name, payload):
-    r = requests.post(f"{base}/rest/v1/rpc/{name}",
-        headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                 "Content-Type": "application/json"},
-        data=json.dumps(payload), timeout=60)
-    if r.status_code >= 300:
-        raise RuntimeError(f"{name} {r.status_code}: {r.text[:200]}")
-    return r.json() if r.text else None
-
-
-def main():
+def walk(run):
     t0 = time.time()
     budget_s = 60 * int((os.environ.get("TIME_BUDGET_MIN") or "100").strip() or "100")
-
-    base   = os.environ["SUPABASE_URL"].rstrip("/")
-    anon   = os.environ["SUPABASE_ANON_KEY"]
-    secret = os.environ["INGEST_SECRET"]
 
     today = dt.date.today()
     end   = dt.datetime.strptime(os.environ["END_DATE"], "%Y%m%d").date() \
@@ -43,7 +33,7 @@ def main():
     start = dt.datetime.strptime(os.environ["START_DATE"], "%Y%m%d").date() \
             if os.environ.get("START_DATE") else today - dt.timedelta(days=1095)  # 3 years
 
-    cur = rpc(base, anon, "backfill_get", {"p_key": "hail", "p_secret": secret})
+    cur = run.rpc_read("backfill_get", {"p_key": "hail", "p_secret": run.secret}).json()
     cursor = dt.datetime.strptime(cur, "%Y-%m-%d").date() if cur else end + dt.timedelta(days=1)
 
     states = sorted(m.PERMITTED_STATES)
@@ -58,16 +48,22 @@ def main():
         if time.time() - t0 > budget_s:
             print(f"Time budget reached after {done} date(s). Next run resumes before {cursor}.")
             break
-        ds = day.strftime("%Y%m%d")
-        try:
-            n = m.process_local_date(ds, states, base, anon, secret)
-            print(f"  {day}: {n} state-day(s) written  [{int(time.time()-t0)}s elapsed]")
-        except Exception as e:
-            print(f"  [error] {day}: {e} -- advancing past it")
-        rpc(base, anon, "backfill_set", {"p_key": "hail", "p_value": day.strftime("%Y-%m-%d"), "p_secret": secret})
+        n = m.process_local_date(run, day.strftime("%Y%m%d"), states)
+        if run.day(day.isoformat())["status"] == "error":
+            print(f"  [STOP] {day} did not ingest completely; cursor stays at {cursor}.")
+            break
+        print(f"  {day}: {n} state-day(s) written  [{int(time.time()-t0)}s elapsed]")
+        if not run.dry_run:
+            run._post("backfill_set", {"p_key": "hail", "p_value": day.strftime("%Y-%m-%d"),
+                                       "p_secret": run.secret}, 60)
         cursor = day
         done += 1
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        _run = fg.Run("hail-backfill")
+    except fg.FeedError as e:
+        print(f"::error::{e}")
+        raise SystemExit(2)
+    fg.main_guard(_run, walk)

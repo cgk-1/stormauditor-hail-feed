@@ -15,25 +15,48 @@ future date-convention change a pure database relabel, never a re-download.
 
 Also retained from v2: 0.50" capture floor, exact point values, in-state max,
 MultiPolygon coercion, complete state boundaries, retries, chunked point writes.
-Retention: 3 years, purged incrementally by purge_old_hail() on every run.
+
+STAGE 1 HARDENING (Archive Phase 5, 2026-10-07) - the math is unchanged; the
+payloads are byte-identical to the previous version on normal days:
+  * Upstream fallback: IEM mtarchive is the primary source; when it does not
+    have an anchor file (it holds nothing before 2022-06-15) the SAME file is
+    read from AWS noaa-mrms-pds (gzip bytes proven identical on overlap dates).
+    Never a neighbouring file: a missing anchor fails its states loudly.
+  * Strict validation of every MESH file (message count, discipline/category/
+    parameter, 7000x3500 0.01-degree grid at 54.995N/129.995W, scan order,
+    valid time = anchor, value codes, coverage) and of every state's output
+    (lattice, bounds, value range, duplicates). Anything unexpected: that
+    state-day is NOT written, a quarantine record is saved, the run fails.
+  * Per-state failures are no longer swallowed: complete states are still
+    written, the job ends non-zero and the summary lists both.
+  * Every anchor of a day is fetched before anything is written. Scheduled
+    runs DEFER the newest day (write nothing, green run) while an anchor is
+    not published yet; the next dispatch's zero-state self-heal ingests it.
+    Explicit DATE runs fail instead. (At 10:10Z all anchors exist: the last,
+    08Z in winter, lands ~08:08Z.)
+  * Cold-season guard (COLD_GUARD=1 default, 0 = off): its IEM checks retry and
+    a failed check now fails that state-day instead of silently keeping it.
+  * State boundaries are vendored (data/us-states.json, md5-checked).
+  * DRY_RUN=1, DATE=YYYY-MM-DD|START..END, completeness summary and the
+    FEED_RESULT json line: see feedguard.py.
 
 Env (GitHub secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
-Optional: INGEST_DATE (local YYYYMMDD, single/comma/range a:b), STATES,
-          STATE_PAUSE (sec between states, default 0.4)
+Optional: DATE / INGEST_DATE (local dates), STATES, STATE_PAUSE (sec between
+          states, default 0.4), COLD_GUARD (1/0), DRY_RUN (1/0), FEED_OUT_DIR
 
-Deps: pygrib numpy rasterio shapely requests
+Deps: requirements.txt (exact pins)
 """
-import os, gzip, json, time, datetime as dt
+import os, gzip, json, time, tempfile, datetime as dt
 from zoneinfo import ZoneInfo
-import urllib.request
 import numpy as np
 import pygrib
-import requests
 from rasterio.features import shapes
 from rasterio.transform import from_origin
 from shapely.geometry import shape, mapping, Point, MultiPolygon, Polygon
 from shapely.prepared import prep
 from shapely.ops import unary_union
+
+import feedguard as fg
 
 BANDS = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
 POINT_FLOOR = 0.50
@@ -78,14 +101,39 @@ STATE_ABBR = {
 # EVERY month incl. January; New York had 389 cold-month days with no ground
 # report, avg 1.5in). The guard below drops a cold-month state-day ONLY when
 # BOTH lines of evidence say artifact: zero in-state hail LSRs for the local
-# day AND the statewide max temperature stayed below 45F. Any fetch failure
-# keeps the day (fail-open) so real hail in rural / under-spotted areas is
-# never dropped just for lack of a report.
+# day AND the statewide max temperature stayed below 45F. Since 2026-10-07 a
+# check that cannot be completed (IEM down after retries, unexpected reply)
+# FAILS that state-day loudly instead of keeping it silently.
 COLD_MONTHS = {11, 12, 1, 2, 3}
 
-BOUNDARY_URL = "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json"
+# State boundaries: PublicaMundi us-states.json (52 features), vendored
+# 2026-10-07 from raw.githubusercontent.com/PublicaMundi/MappingAPI/master/
+# data/geojson/us-states.json - byte-identical to what every earlier run
+# downloaded at runtime. A changed file would silently change which cells
+# belong to a state, so the md5 is enforced.
+HERE = os.path.dirname(os.path.abspath(__file__))
+BOUNDARY_FILE = os.path.join(HERE, "data", "us-states.json")
+BOUNDARY_MD5 = "56968c4d4db9777511c4fd363e684a5c"
 _CACHE = {}
 _ALL_STATES_CACHE = None
+
+# MESH_Max_1440min sources. Identical gzip bytes (md5-verified 2023-01-01,
+# 2024-05-28, 2026-10-05). IEM has nothing before 2022-06-15.
+MESH_IEM_URL = ("https://mtarchive.geol.iastate.edu/{y}/{m}/{d}/mrms/ncep/MESH_Max_1440min/"
+                "MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
+MESH_AWS_URL = ("https://noaa-mrms-pds.s3.amazonaws.com/CONUS/MESH_Max_1440min_00.50/{ds}/"
+                "MRMS_MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
+
+# What every MESH_Max_1440min file must look like (identical 2021-10 -> 2026-10).
+MESH_INT_KEYS = {"discipline": 209, "parameterCategory": 3, "parameterNumber": 34,
+                 "Ni": 7000, "Nj": 3500, "jScansPositively": 0, "iScansNegatively": 0}
+MESH_FLOAT_KEYS = {"latitudeOfFirstGridPointInDegrees": 54.995,
+                   "longitudeOfFirstGridPointInDegrees": 230.005,
+                   "iDirectionIncrementInDegrees": 0.01, "jDirectionIncrementInDegrees": 0.01}
+MESH_CODES = {-3.0, -1.0}       # -3 = no radar coverage, -1 = no hail
+MESH_MAX_MM = fg.env_float("MESH_MAX_MM", 1000.0)          # encoding sanity, not physics
+MESH_MAX_NOCOV = fg.env_float("MESH_MAX_NOCOV_FRAC", 0.50)  # observed 0.33-0.39 (2021-2026)
+MESH_PUBLISH_GRACE_H = fg.env_float("MESH_PUBLISH_GRACE_H", 12.0)
 
 
 def load_state_geom(name):
@@ -93,7 +141,13 @@ def load_state_geom(name):
     if name in _CACHE:
         return _CACHE[name]
     if _ALL_STATES_CACHE is None:
-        gj = json.loads(urllib.request.urlopen(BOUNDARY_URL, timeout=60).read())
+        with open(BOUNDARY_FILE, "rb") as fh:
+            raw = fh.read()
+        import hashlib
+        got = hashlib.md5(raw).hexdigest()
+        if got != BOUNDARY_MD5:
+            raise fg.ValidationError(f"state boundary file md5 {got} != pinned {BOUNDARY_MD5}")
+        gj = json.loads(raw)
         _ALL_STATES_CACHE = {f["properties"]["name"]: f["geometry"] for f in gj["features"]}
     if name not in _ALL_STATES_CACHE:
         raise RuntimeError(f"no boundary found for {name}")
@@ -118,27 +172,87 @@ def window_end_utc(state, local_date_str):
     return end.replace(second=0, microsecond=0)
 
 
-def fetch_mesh_at(anchor_utc):
-    """Download the MESH_Max_1440min file whose window ends at anchor_utc.
-    Retries; returns mm array or None."""
+def fetch_mesh_raw(anchor_utc):
+    """gzip bytes of the MESH_Max_1440min file ending at anchor_utc.
+    IEM first, AWS when IEM does not have it (or keeps failing).
+    Returns (raw, source, notes). Raises UpstreamMissing when neither has it."""
     ds = anchor_utc.strftime("%Y%m%d")
     ts = anchor_utc.strftime("%H%M%S")
-    url = (f"https://mtarchive.geol.iastate.edu/{ds[:4]}/{ds[4:6]}/{ds[6:]}/mrms/ncep/"
-           f"MESH_Max_1440min/MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
-    for attempt in range(4):
+    urls = [("IEM", MESH_IEM_URL.format(y=ds[:4], m=ds[4:6], d=ds[6:], ds=ds, ts=ts)),
+            ("AWS", MESH_AWS_URL.format(ds=ds, ts=ts))]
+    notes, missing = [], 0
+    for src, url in urls:
         try:
-            raw = urllib.request.urlopen(url, timeout=120).read()
-            with open("/tmp/_mesh.grib2", "wb") as fh:
-                fh.write(gzip.decompress(raw))
-            g = pygrib.open("/tmp/_mesh.grib2")
-            vals = np.asarray(g[1].values)
+            return fg.http_get(url, timeout=120, retries=4, what=f"MESH {src} {ds}-{ts}"), src, notes
+        except fg.UpstreamMissing as e:
+            missing += 1
+            notes.append(str(e))
+        except fg.UpstreamError as e:
+            notes.append(str(e))
+    if missing == len(urls):
+        raise fg.UpstreamMissing(f"MESH anchor {ds}-{ts} is on neither IEM nor AWS")
+    raise fg.UpstreamError(f"MESH anchor {ds}-{ts} could not be fetched: {' | '.join(notes)}")
+
+
+def decode_mesh(raw, anchor_utc):
+    """Decode + validate one MESH file. Returns the mm array exactly as before
+    (np.asarray of the single message's values)."""
+    try:
+        grib = gzip.decompress(raw)
+    except Exception as e:
+        raise fg.ValidationError(f"MESH gzip unreadable: {e}")
+    fd, path = tempfile.mkstemp(suffix=".grib2")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(grib)
+        g = pygrib.open(path)
+        try:
+            if g.messages != 1:
+                raise fg.ValidationError(f"MESH file has {g.messages} messages (expected 1)")
+            m = g[1]
+            for k, want in MESH_INT_KEYS.items():
+                if int(m[k]) != want:
+                    raise fg.ValidationError(f"MESH {k}={m[k]} (expected {want})")
+            if m["gridType"] != "regular_ll":
+                raise fg.ValidationError(f"MESH gridType={m['gridType']} (expected regular_ll)")
+            for k, want in MESH_FLOAT_KEYS.items():
+                if abs(float(m[k]) - want) > 1e-5:
+                    raise fg.ValidationError(f"MESH {k}={m[k]} (expected {want})")
+            vd, vt = int(m["validityDate"]), int(m["validityTime"])
+            if (vd, vt) != (int(anchor_utc.strftime("%Y%m%d")), anchor_utc.hour * 100 + anchor_utc.minute):
+                raise fg.ValidationError(f"MESH valid time {vd} {vt:04d} != anchor {anchor_utc.isoformat()}")
+            raw_vals = m.values
+            if np.ma.isMaskedArray(raw_vals) and np.ma.is_masked(raw_vals):
+                raise fg.ValidationError("MESH field carries a bitmap/mask (not expected)")
+            vals = np.asarray(raw_vals)
+        finally:
             g.close()
-            return vals
-        except Exception as e:
-            if attempt == 3:
-                print(f"  [warn] fetch failed {url}: {e}")
-                return None
-            time.sleep(2 * (attempt + 1))
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if vals.shape != (3500, 7000):
+        raise fg.ValidationError(f"MESH grid shape {vals.shape} (expected (3500, 7000))")
+    if not np.isfinite(vals).all():
+        raise fg.ValidationError(f"MESH has {int((~np.isfinite(vals)).sum())} non-finite values")
+    neg = set(np.unique(vals[vals < 0]).tolist())
+    if not neg <= MESH_CODES:
+        raise fg.ValidationError(f"MESH has unexpected negative codes {sorted(neg - MESH_CODES)[:5]}")
+    vmax = float(vals.max())
+    if vmax > MESH_MAX_MM:
+        raise fg.ValidationError(f"MESH max {vmax} mm > {MESH_MAX_MM} (encoding?)")
+    nocov = float((vals == -3).mean())
+    if nocov > MESH_MAX_NOCOV:
+        raise fg.ValidationError(f"MESH no-coverage fraction {nocov:.3f} > {MESH_MAX_NOCOV} "
+                                 f"(radar outage?)")
+    return vals
+
+
+def fetch_mesh_at(anchor_utc):
+    """Backward-compatible helper: validated mm array (raises on any problem)."""
+    raw, _src, _notes = fetch_mesh_raw(anchor_utc)
+    return decode_mesh(raw, anchor_utc)
 
 
 def classify(vals_mm):
@@ -224,82 +338,106 @@ def extract_points(inches, geom, floor=POINT_FLOOR):
     return out
 
 
+def validate_state_output(state, geom, bands, pts):
+    """The payload must look like every payload before it: on-lattice in-state
+    points 0.50-8.00 in with no duplicates; ordered known bands of
+    MultiPolygons. Raises ValidationError otherwise."""
+    minx, miny, maxx, maxy = geom.bounds
+    seen = set()
+    for p in pts:
+        lon, lat, v = p["lon"], p["lat"], p["v"]
+        if not (POINT_FLOOR <= v <= 8.0):
+            raise fg.ValidationError(f"{state}: point value {v} outside 0.50-8.00 in")
+        if not (minx - 0.01 <= lon <= maxx + 0.01 and miny - 0.01 <= lat <= maxy + 0.01):
+            raise fg.ValidationError(f"{state}: point {lon},{lat} outside the state bounds")
+        if round(abs(lon) * 1000) % 10 != 5 or round(abs(lat) * 1000) % 10 != 5:
+            raise fg.ValidationError(f"{state}: point {lon},{lat} is off the MRMS 0.01-degree lattice")
+        if (lon, lat) in seen:
+            raise fg.ValidationError(f"{state}: duplicate point {lon},{lat}")
+        seen.add((lon, lat))
+    last = 0
+    for b in bands:
+        if not (last < b["band"] <= len(BANDS)) or b["min_in"] != BANDS[b["band"] - 1]:
+            raise fg.ValidationError(f"{state}: unexpected band {b['band']}/{b['min_in']}")
+        if b["geom"]["type"] != "MultiPolygon" or not b["geom"]["coordinates"]:
+            raise fg.ValidationError(f"{state}: band {b['band']} geometry {b['geom']['type']}")
+        last = b["band"]
+
+
 def cold_season_check(state, date_iso, anchor_utc):
-    """(skip?, reason). Cold-month artifact guard — see COLD_MONTHS note."""
+    """(skip?, reason). Cold-month artifact guard — see COLD_MONTHS note.
+    Raises when the evidence cannot be read (the caller fails that state-day)."""
     ab = STATE_ABBR.get(state)
     if not ab:
         return (False, "")
-    try:
-        sts = (anchor_utc - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%MZ")
-        ets = anchor_utc.strftime("%Y-%m-%dT%H:%MZ")
-        url = (f"https://mesonet.agron.iastate.edu/geojson/lsr.py?sts={sts}&ets={ets}"
-               f"&states={ab}&type=H")
-        gj = json.loads(urllib.request.urlopen(url, timeout=60).read())
-        if gj.get("features"):
-            return (False, "")   # ground-truth hail exists — always keep
-    except Exception:
-        return (False, "")       # can't check reports — keep the day
-    try:
-        url = f"https://mesonet.agron.iastate.edu/api/1/daily.json?network={ab}_ASOS&date={date_iso}"
-        data = json.loads(urllib.request.urlopen(url, timeout=60).read()).get("data", [])
-        temps = [r.get("max_tmpf") for r in data if isinstance(r.get("max_tmpf"), (int, float))]
-        if temps and max(temps) < 45.0:
-            return (True, f"no hail LSR + statewide max temp {max(temps):.0f}F < 45F (bright-band signature)")
-    except Exception:
-        pass
+    sts = (anchor_utc - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%MZ")
+    ets = anchor_utc.strftime("%Y-%m-%dT%H:%MZ")
+    url = (f"https://mesonet.agron.iastate.edu/geojson/lsr.py?sts={sts}&ets={ets}"
+           f"&states={ab}&type=H")
+    gj = json.loads(fg.http_get(url, timeout=60, retries=4, what=f"cold-guard LSR {ab} {date_iso}"))
+    if not isinstance(gj, dict) or not isinstance(gj.get("features"), list):
+        raise fg.ValidationError(f"cold guard: unexpected LSR reply for {ab}")
+    if gj["features"]:
+        return (False, "")   # ground-truth hail exists — always keep
+    url = f"https://mesonet.agron.iastate.edu/api/1/daily.json?network={ab}_ASOS&date={date_iso}"
+    js = json.loads(fg.http_get(url, timeout=60, retries=4, what=f"cold-guard daily {ab} {date_iso}"))
+    if not isinstance(js, dict) or not isinstance(js.get("data"), list):
+        raise fg.ValidationError(f"cold guard: unexpected daily.json reply for {ab}")
+    temps = [r.get("max_tmpf") for r in js["data"] if isinstance(r.get("max_tmpf"), (int, float))]
+    if temps and max(temps) < 45.0:
+        return (True, f"no hail LSR + statewide max temp {max(temps):.0f}F < 45F (bright-band signature)")
     return (False, "")
 
 
-def db_day_states(base, anon, date_iso):
-    """How many states already have hail rows for date_iso (-1 = unknown)."""
-    try:
-        r = requests.get(f"{base}/rest/v1/hail_days",
-                         params={"valid_date": f"eq.{date_iso}", "select": "state"},
-                         headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                                  "Prefer": "count=exact", "Range": "0-0"},
-                         timeout=30)
-        cr = r.headers.get("Content-Range", "")
-        return int(cr.split("/")[-1]) if "/" in cr else -1
-    except Exception:
-        return -1
-
-
-def rpc(base, anon, name, payload):
-    last = ""
-    for attempt in range(4):
-        try:
-            r = requests.post(f"{base}/rest/v1/rpc/{name}",
-                              headers={"apikey": anon, "Authorization": f"Bearer {anon}",
-                                       "Content-Type": "application/json"},
-                              data=json.dumps(payload), timeout=120)
-            if r.status_code < 300:
-                return r
-            last = f"{name} {r.status_code}: {r.text[:200]}"
-        except Exception as e:
-            last = f"{name} exception: {e}"
-        time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(last)
-
-
-def process_local_date(local_date, states, base, anon, secret, pause=0.4):
+def process_local_date(run, local_date, states, pause=0.4, cold_guard=True, policy="strict"):
     """Ingest one LOCAL calendar date for the given states. States are grouped
     by their UTC anchor so each distinct anchor file is downloaded once
-    (typically 4-5 downloads for all 48 states)."""
+    (typically 4-5 downloads for all 48 states). Returns states written."""
     date_iso = f"{local_date[:4]}-{local_date[4:6]}-{local_date[6:]}"
+    key = date_iso
     groups = {}
     for st in states:
-        if st not in PERMITTED_STATES:
-            print(f"  [skip] {st} not permitted")
-            continue
         groups.setdefault(window_end_utc(st, local_date), []).append(st)
+    run.expect(key, "states", len(states))
+    run.expect(key, "anchors", len(groups))
+
+    # 2026-10-07: every anchor file is fetched BEFORE anything is written. When
+    # the newest day's anchors are not all published yet (MESH lands ~8 min
+    # after the hour), a scheduled run (policy defer) writes nothing and the
+    # zero-state self-heal of the next dispatch (12:10Z / 16:10Z) ingests it.
+    raws, missing = {}, []
+    for anchor in sorted(groups):
+        try:
+            raws[anchor] = fetch_mesh_raw(anchor)
+        except fg.UpstreamMissing as e:
+            missing.append(anchor)
+            raws[anchor] = e
+        except fg.FeedError as e:
+            raws[anchor] = e
+    if missing and policy == "defer" and all(
+            dt.datetime.now(UTC) - a < dt.timedelta(hours=MESH_PUBLISH_GRACE_H) for a in missing):
+        run.defer(key, f"MESH anchor(s) {[a.strftime('%m-%d %H%MZ') for a in missing]} not published "
+                       f"yet; nothing written - the next dispatch ingests the day",
+                  pending=[a.isoformat() for a in missing])
+        return 0
 
     stored = 0
     for anchor, group_states in sorted(groups.items()):
-        vals = fetch_mesh_at(anchor)
-        if vals is None:
-            print(f"  {date_iso}: no MESH file for anchor {anchor.isoformat()}; "
-                  f"skipping {len(group_states)} state(s)")
+        try:
+            if isinstance(raws[anchor], Exception):
+                raise raws[anchor]
+            raw, src, notes = raws[anchor]
+            vals = decode_mesh(raw, anchor)
+        except fg.FeedError as e:
+            run.error(key, f"anchor {anchor.strftime('%H%MZ')}", str(e),
+                      details={"anchor_utc": anchor.isoformat(), "states": group_states})
+            for st in group_states:
+                run.day(key)["failed"].append(st)
             continue
+        run.receive(key, "anchors")
+        run.receive(key, f"anchors_{src}")
+        if src != "IEM":
+            run.note(key, f"anchor {anchor.isoformat()} read from {src} ({'; '.join(notes)})")
         cls, inches = classify(vals)
         wend = anchor.isoformat()
         for st in group_states:
@@ -307,54 +445,66 @@ def process_local_date(local_date, states, base, anon, secret, pause=0.4):
                 geom = load_state_geom(st)
                 bands = build_bands(cls, geom)
                 if not bands:
+                    run.empty(key, st)
                     continue
                 pts = extract_points(inches, geom)
                 if not pts:
+                    run.empty(key, st)
                     continue
                 max_in = max(p["v"] for p in pts)
-                if int(date_iso[5:7]) in COLD_MONTHS:
+                if int(date_iso[5:7]) in COLD_MONTHS and cold_guard:
                     skip, why = cold_season_check(st, date_iso, anchor)
                     if skip:
                         print(f"  {date_iso}  {st:16s} [cold-season artifact guard] skipped: {why}")
+                        run.skip(key, "cold_guard", st)
                         continue
-                rpc(base, anon, "ingest_swath",
-                    {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                     "p_max_in": max_in, "p_features": bands, "p_window_end": wend})
+                validate_state_output(st, geom, bands, pts)
+                calls = [("ingest_swath",
+                          {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                           "p_max_in": max_in, "p_features": bands, "p_window_end": wend})]
                 for i in range(0, len(pts), 4000):
-                    rpc(base, anon, "ingest_points",
-                        {"p_secret": secret, "p_state": st, "p_date": date_iso,
-                         "p_points": pts[i:i+4000], "p_append": i > 0,
-                         "p_window_end": wend})
+                    calls.append(("ingest_points",
+                                  {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                                   "p_points": pts[i:i+4000], "p_append": i > 0,
+                                   "p_window_end": wend}))
+                run.write(key, st, calls)
+                run.written(key, st)
                 stored += 1
                 print(f"  {date_iso}  {st:16s} max {max_in}\" ({len(bands)} band(s), "
                       f"{len(pts)} pts, window end {wend})")
-                time.sleep(pause)
+                if not run.dry_run:
+                    time.sleep(pause)
             except Exception as e:
-                print(f"  [error] {date_iso} {st}: {e}")
-    if stored == 0:
+                run.error(key, st, f"{type(e).__name__}: {e}",
+                          details={"anchor_utc": wend})
+    run.set_received(key, "states_ok", len(run.day(key)["written"]) + len(run.day(key)["empty"])
+                     + len(run.day(key)["skipped"].get("cold_guard", [])))
+    if stored == 0 and not run.day(key)["failed"]:
         print(f"{date_iso}: no on-land hail >= {POINT_FLOOR}\" in selected state(s).")
     return stored
 
 
-def main():
-    base = os.environ["SUPABASE_URL"].rstrip("/")
-    anon = os.environ["SUPABASE_ANON_KEY"]
-    secret = os.environ["INGEST_SECRET"]
-    pause = float(os.environ.get("STATE_PAUSE", "0.4") or "0.4")
+def parse_states():
+    states_env = (os.environ.get("STATES") or "").strip()
+    if not states_env:
+        return sorted(PERMITTED_STATES)
+    states = [s.strip() for s in states_env.split(",") if s.strip()]
+    bad = [s for s in states if s not in PERMITTED_STATES]
+    if bad:
+        raise fg.ValidationError(f"STATES has unknown/not permitted state(s): {bad}")
+    return states
 
-    raw = os.environ.get("INGEST_DATE")
+
+def main(run):
+    pause = float(os.environ.get("STATE_PAUSE", "0.4") or "0.4")
+    cold_guard = (os.environ.get("COLD_GUARD") or "1").strip() != "0"
+    run.meta.update({"boundary_md5": BOUNDARY_MD5, "cold_guard": cold_guard,
+                     "numpy": np.__version__, "pygrib": pygrib.__version__})
+
+    explicit = fg.requested_dates()
     dates = []
-    if raw:
-        for tok in [d.strip() for d in raw.split(",") if d.strip()]:
-            if ":" in tok:
-                a, b = tok.split(":")
-                d0 = dt.datetime.strptime(a, "%Y%m%d").date()
-                d1 = dt.datetime.strptime(b, "%Y%m%d").date()
-                cur = d0
-                while cur <= d1:
-                    dates.append(cur.strftime("%Y%m%d")); cur += dt.timedelta(days=1)
-            else:
-                dates.append(tok)
+    if explicit is not None:
+        dates = [d.strftime("%Y%m%d") for d in explicit]
     else:
         # Scheduled run: yesterday, PLUS SELF-HEAL (2026-08-27): re-ingest any
         # of the 2 days before that with ZERO ingested states — catches late
@@ -366,31 +516,44 @@ def main():
         # has zero states for it — so the morning run does the real work and
         # the afternoon self-heal pass costs three count queries (~seconds)
         # unless something actually failed. No duplicate daily rewrites.
+        # 2026-10-07: a count that cannot be read is an error (it used to be
+        # treated as "not zero" and the day was silently skipped).
         today = dt.datetime.now(UTC).date()
         for back in (1, 2, 3):
             d = today - dt.timedelta(days=back)
-            if db_day_states(base, anon, d.strftime("%Y-%m-%d")) == 0:
+            try:
+                n = run.rest_count("hail_days", {"valid_date": f"eq.{d.isoformat()}", "select": "state"})
+            except Exception as e:
+                run.error(d.isoformat(), "self-heal check", str(e), quarantine=False)
+                continue
+            if n == 0:
                 if back > 1:
                     print(f"[self-heal] {d} has zero ingested states — re-running that date")
                 dates.append(d.strftime("%Y%m%d"))
         if not dates:
             print("All recent dates already ingested — nothing to do.")
-    states_env = os.environ.get("STATES")
-    states = ([s.strip() for s in states_env.split(",")] if states_env
-              else sorted(PERMITTED_STATES))
+    states = parse_states()
 
-    print(f"MESH ingest v3 (local-clock days): {len(dates)} date(s), {len(states)} state(s)")
+    print(f"MESH ingest v3 (local-clock days): {len(dates)} date(s), {len(states)} state(s)"
+          f"{'' if cold_guard else ' [COLD_GUARD=0]'}")
     total = 0
+    policy = "strict" if explicit is not None else "defer"
     for d in dates:
-        total += process_local_date(d, states, base, anon, secret, pause)
+        total += process_local_date(run, d, states, pause, cold_guard, policy)
 
-    try:
-        rpc(base, anon, "purge_old_hail", {"p_secret": secret})
-        print("Rolling purge: removed hail data older than 3 years.")
-    except Exception as e:
-        print(f"[warn] purge failed: {e}")
+    if not run.dry_run:
+        try:
+            run._post("purge_old_hail", {"p_secret": run.secret}, 120)
+            print("Rolling purge: removed hail data older than 3 years.")
+        except Exception as e:
+            print(f"[warn] purge failed: {e}")
     print(f"Done. {total} state-day(s) written across {len(dates)} date(s).")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        _run = fg.Run("hail")
+    except fg.FeedError as e:
+        print(f"::error::{e}")
+        raise SystemExit(2)
+    fg.main_guard(_run, main)
