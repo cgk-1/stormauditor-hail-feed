@@ -16,9 +16,11 @@ on:
         description: "Comma list of states. Blank = all permitted."
         required: false
 
+# One run at a time; a second trigger queues behind the first (never cancels it).
+concurrency: {group: hail-ingest, cancel-in-progress: false}
 jobs:
   ingest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
