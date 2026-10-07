@@ -1,0 +1,28 @@
+name: keepalive
+# Owner-approved 2026-10-07 (Connor: "i approve small keep alive"; AI-HANDBOOK §8c).
+# GitHub disables scheduled workflows in public repos after 60 days without
+# repository activity. Once a month this re-enables ONLY the listed, already
+# active workflows (and itself) through the API — no commits, no data work.
+# Manually disabled workflows (backfills, gap refills) are never touched.
+on:
+  schedule:
+    - cron: "17 6 3 * *"   # 06:17 UTC on the 3rd (outside feed/build windows)
+  workflow_dispatch:
+permissions:
+  actions: write
+concurrency: {group: keepalive, cancel-in-progress: false}
+jobs:
+  keepalive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Re-enable active scheduled workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for wf in hail-ingest-new.yml keepalive.yml; do
+            gh api -X PUT "repos/$REPO/actions/workflows/$wf/enable"
+            echo "enabled $wf: $(gh api "repos/$REPO/actions/workflows/$wf" --jq .state)"
+          done
