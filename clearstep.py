@@ -24,6 +24,19 @@ Never called:
 
 The call goes through run._post, NOT run.write: it is not part of the
 recorded payload, so payload md5s stay comparable with earlier code.
+
+REDO SHADOW (owner decision 2026-10-07, option C; migration
+20261007170000_phase5_stage4_redo_shadow.sql). On the same explicit-date,
+non-DRY_RUN runs, before_day() snapshots the (source, day) BEFORE anything is
+written (hz_redo_snapshot copies the day's raw + archive rows into the shadow
+tables). If the snapshot fails or is refused (disk guard), the day is NOT
+written. A held snapshot from an earlier run or from the operator is reused
+(status 'exists'): the original pre-redo state is never overwritten. After the
+write and the clear-step, postcheck() compares the day's live row counts with
+the payload (hz_redo_counts); the shadow is released only when that passes AND
+REDO_RELEASE=1. By default it is kept for release after the blind verifier.
+REDO_SNAPSHOT=0 is an emergency off switch (never for repairs). Run id:
+REDO_RUN_ID, else "<feed>-<GITHUB_RUN_ID>".
 """
 import os
 
@@ -113,3 +126,93 @@ def after_day(run, key, src, scope_states, written_scopes, *, explicit, max_stat
     else:
         print(f"  [clear-step] {key} {src}: nothing stale", flush=True)
     return res
+
+
+# ------------------------------------------------------------------ redo shadow
+SNAP_RPC = "hz_redo_snapshot"
+
+
+def redo_run_id(run):
+    rid = (os.environ.get("REDO_RUN_ID") or "").strip()
+    return rid or f"{run.feed}-{os.environ.get('GITHUB_RUN_ID') or 'local'}"
+
+
+def before_day(run, key, src, *, explicit):
+    """Snapshot (src, day) before an explicit-date write. True = the day may be written."""
+    if not explicit:
+        return True
+    d = run.day(key)
+    plan = {"rpc": SNAP_RPC, "src": src, "run_id": redo_run_id(run)}
+    if (os.environ.get("REDO_SNAPSHOT") or "1").strip() == "0":
+        plan["skipped"] = "REDO_SNAPSHOT=0"
+        d["redo"] = plan
+        run.warn(key, f"redo snapshot {src}: DISABLED (REDO_SNAPSHOT=0) - the old rows are not kept")
+        return True
+    if run.dry_run:
+        plan["dry_run"] = True
+        d["redo"] = plan
+        print(f"  [redo] {key} {src}: DRY RUN - would snapshot the day before writing "
+              f"(run id {plan['run_id']})", flush=True)
+        return True
+    try:
+        r = run._post(SNAP_RPC, {"p_secret": run.secret, "p_src": src, "p_date": str(key),
+                                 "p_run_id": plan["run_id"],
+                                 "p_max_db_gb": float(os.environ.get("REDO_MAX_DB_GB") or 20)}, 120)
+        res = r.json() or {}
+    except Exception as e:
+        plan["error"] = f"{type(e).__name__}: {e}"
+        d["redo"] = plan
+        run.error(key, "redo-snapshot", f"{src}: {plan['error']} - day NOT written (take the snapshot "
+                                        f"through the management API, then re-run)")
+        return False
+    plan.update({"status": res.get("status"), "snap_id": res.get("snap_id"),
+                 "held_run_id": res.get("run_id"), "counts": res.get("counts")})
+    d["redo"] = plan
+    if res.get("status") not in ("taken", "exists"):
+        run.error(key, "redo-snapshot", f"{src}: snapshot {res.get('status')} ({res.get('reason')}, "
+                                        f"db {res.get('db_bytes')} bytes) - day NOT written")
+        return False
+    print(f"  [redo] {key} {src}: snapshot {res.get('status')} (snap {res.get('snap_id')}, "
+          f"run {res.get('run_id')}): {res.get('counts')}", flush=True)
+    return True
+
+
+def postcheck(run, key, src, expect):
+    """After a fully successful write (+ clear-step): live counts vs the payload.
+    expect = {table: expected_rows} (only tables whose count the write fully decides).
+    Releases the shadow only when every count matches AND REDO_RELEASE=1."""
+    d = run.day(key)
+    redo = d.get("redo")
+    if not redo or run.dry_run or redo.get("status") not in ("taken", "exists"):
+        return None
+    if d["status"] in ("error", "deferred") or d["failed"]:
+        redo["postcheck"] = "skipped: day not fully successful - shadow KEPT"
+        run.note(key, f"redo {src}: day not fully successful - shadow kept (restore with hz_redo_restore)")
+        return None
+    try:
+        live = run._post("hz_redo_counts", {"p_secret": run.secret, "p_src": src, "p_date": str(key)}, 120).json()
+    except Exception as e:
+        redo["postcheck"] = f"counts unreadable ({type(e).__name__}: {e}) - shadow KEPT"
+        run.warn(key, f"redo {src}: {redo['postcheck']}")
+        return None
+    diffs = {t: {"live": live.get(t), "payload": n} for t, n in expect.items() if live.get(t) != n}
+    redo["postcheck"] = {"ok": not diffs, "live": live, "diffs": diffs}
+    if diffs:
+        run.warn(key, f"redo {src}: live row counts differ from the payload {diffs} - shadow KEPT for review")
+        return False
+    if (os.environ.get("REDO_RELEASE") or "0").strip() == "1":
+        try:
+            rel = run._post("hz_redo_release", {"p_secret": run.secret, "p_src": src, "p_date": str(key),
+                                                "p_run_id": redo.get("held_run_id") or redo["run_id"]}, 120).json()
+            redo["released"] = rel
+        except Exception as e:
+            run.warn(key, f"redo {src}: release failed ({type(e).__name__}: {e}); shadow kept")
+    else:
+        run.note(key, f"redo {src}: counts match; shadow kept until the blind verifier passes "
+                      f"(release: hz_redo_release / hz_redo_release_run '{redo.get('held_run_id') or redo['run_id']}')")
+    return True
+
+
+def rows(run, key, name):
+    """Payload rows recorded for one RPC payload key (e.g. 'ingest_points.p_points')."""
+    return run.day(key)["rows"].get(name, 0)

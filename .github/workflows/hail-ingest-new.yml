@@ -24,6 +24,12 @@ on:
       clear_step:
         description: "Explicit-date runs only: 1 (default) = after a fully successful day, clear stale rows of states not re-supplied (hz_day_clear_states_v2). 0 = off."
         required: false
+      redo_run_id:
+        description: "Explicit dates only: name of the redo-shadow run (default <feed>-<run id>), e.g. wind-repair-c1."
+        required: false
+      redo_release:
+        description: "Explicit dates only: 1 = release the day's redo shadow when the post-write row counts match the payload. Default 0 = keep it for release after the blind verifier."
+        required: false
 
 # One run at a time; a second trigger queues behind the first (never cancels it).
 concurrency: {group: hail-ingest, cancel-in-progress: false}
@@ -50,6 +56,8 @@ jobs:
           DRY_RUN:           ${{ github.event.inputs.dry_run }}
           DAY_CONVENTION:    ${{ github.event.inputs.day_convention || 'v4' }}
           CLEAR_STEP:        ${{ github.event.inputs.clear_step }}
+          REDO_RUN_ID:       ${{ github.event.inputs.redo_run_id }}
+          REDO_RELEASE:      ${{ github.event.inputs.redo_release }}
           FEED_OUT_DIR:      feed-out
         run: python mesh_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)

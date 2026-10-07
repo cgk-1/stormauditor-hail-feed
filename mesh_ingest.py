@@ -835,6 +835,11 @@ def main(run):
     total = 0
     policy = "strict" if explicit is not None else "defer"
     for d in dates:
+        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        # Redo shadow (explicit-date runs only): snapshot the day's old rows first;
+        # no snapshot -> the day is not written (clearstep.py).
+        if not clearstep.before_day(run, key, "HAIL", explicit=explicit is not None):
+            continue
         if conv == "v4":
             total += process_local_date_v4(run, d, states, pause, cold_guard, policy, flags)
         else:
@@ -842,9 +847,14 @@ def main(run):
         # Stage 4 clear-step (explicit-date runs only, fully successful days only):
         # states of this run's scope that were NOT re-supplied lose their stale
         # hail_days / hail_polygons / hail_points rows (clearstep.py).
-        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
         clearstep.after_day(run, key, "HAIL", states, run.day(key)["written"],
                             explicit=explicit is not None)
+        if explicit is not None:
+            exp = {"hail_points": clearstep.rows(run, key, "ingest_points.p_points")}
+            if set(states) == set(PERMITTED_STATES):
+                exp.update({"hail_days": len([s for s in run.day(key)["written"] if s in PERMITTED_STATES]),
+                            "hail_polygons": clearstep.rows(run, key, "ingest_swath.p_features")})
+            clearstep.postcheck(run, key, "HAIL", exp)
 
     if not run.dry_run:
         try:
