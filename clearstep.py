@@ -36,7 +36,7 @@ def enabled():
 
 _DAY_TABLE = {"HAIL": ("hail_days", "valid_date", {}),
               "ANL": ("wind_days", "valid_date", {"obs_only": "is.false"}),
-              "HRRR": ("hz_hrrr_meta", "date", {})}
+              "HRRR": None}         # hz_hrrr_meta is not readable with the feeds' anon key
 
 
 def _existing(run, src, key, cand):
@@ -47,6 +47,8 @@ def _existing(run, src, key, cand):
         return []
     if not (run.base and run.anon):
         return "unknown (no DB credentials in this dry run)"
+    if _DAY_TABLE.get(src) is None:
+        return f"not previewed ({src} day table is not readable with the feed key)"
     import requests
     table, col, extra = _DAY_TABLE[src]
     try:
