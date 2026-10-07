@@ -241,7 +241,9 @@ def decode_mesh(raw, anchor_utc):
         raise fg.ValidationError(f"MESH has unexpected negative codes {sorted(neg - MESH_CODES)[:5]}")
     vmax = float(vals.max())
     if vmax > MESH_MAX_MM:
-        raise fg.ValidationError(f"MESH max {vmax} mm > {MESH_MAX_MM} (encoding?)")
+        # A single spike is capped downstream (8-inch ceiling); don't fail the
+        # whole anchor (~10 states) for it — say so loudly instead.
+        print(f"::warning::MESH max {vmax} mm > {MESH_MAX_MM} (encoding?); values above the cap are clipped downstream")
     nocov = float((vals == -3).mean())
     if nocov > MESH_MAX_NOCOV:
         raise fg.ValidationError(f"MESH no-coverage fraction {nocov:.3f} > {MESH_MAX_NOCOV} "
@@ -366,7 +368,7 @@ def validate_state_output(state, geom, bands, pts):
 
 def cold_season_check(state, date_iso, anchor_utc):
     """(skip?, reason). Cold-month artifact guard — see COLD_MONTHS note.
-    Raises when the evidence cannot be read (the caller fails that state-day)."""
+    Raises when the evidence cannot be read; the caller then keeps the day (fail open)."""
     ab = STATE_ABBR.get(state)
     if not ab:
         return (False, "")
@@ -453,7 +455,13 @@ def process_local_date(run, local_date, states, pause=0.4, cold_guard=True, poli
                     continue
                 max_in = max(p["v"] for p in pts)
                 if int(date_iso[5:7]) in COLD_MONTHS and cold_guard:
-                    skip, why = cold_season_check(st, date_iso, anchor)
+                    try:
+                        skip, why = cold_season_check(st, date_iso, anchor)
+                    except Exception as ge:
+                        # Fail OPEN (pre-2026-10-07 behaviour): when the evidence
+                        # cannot be read, keep the day rather than lose real hail.
+                        skip, why = False, ""
+                        run.warn(key, f"{st}: cold-season guard could not check ({type(ge).__name__}: {ge}); day kept")
                     if skip:
                         print(f"  {date_iso}  {st:16s} [cold-season artifact guard] skipped: {why}")
                         run.skip(key, "cold_guard", st)
