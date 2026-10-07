@@ -40,9 +40,31 @@ payloads are byte-identical to the previous version on normal days:
   * DRY_RUN=1, DATE=YYYY-MM-DD|START..END, completeness summary and the
     FEED_RESULT json line: see feedguard.py.
 
+DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
+  every MRMS cell uses its OWN zone's local day (tzwin.py, data/tz/tz_mrms.npz)
+  instead of its state's zone (plan T1: Pensacola/Panama City CT, El Paso MT,
+  west KS/NE/SD/ND MT, north ID PT, west KY CT, east TN ET, MI UP CT, ...).
+  * The zone windows are the same 4-5 anchors the state groups already fetch
+    (no extra downloads); each cell takes the MESH value of its own zone's
+    anchor; classify/despeckle runs once on that national composite.
+  * window_end_utc is stored PER POINT (its own zone's window end; the archive
+    already keeps a window index per point). hail_days.window_end_utc keeps the
+    state's own zone window (as v3).
+  * DST days (plan T2): the 24 h MESH_Max_1440min file is not the local day.
+    Fall-back (25 h): max(1440 file at the window end, MESH_Max_60min ending at
+    start+1 h). Spring-forward (23 h): the 1440 file covers one hour of the
+    previous day; cells whose 1440 value is only reached in that hour
+    (MESH_Max_60min ending at start >= 1440) take the max of the 23 hourly
+    MESH_Max_60min files of the day instead; every other cell keeps the 1440
+    value (max-of-hourly is NOT identical to the 1440 product: tested 2025-05-19,
+    1,175 of 24.5M cells lower, never higher). 60-min files: AWS noaa-mrms-pds
+    only (~53 KB each; IEM does not archive them). Missing file = the day fails.
+  * Test flags (DRY_RUN only): V4_ZONES=state, V4_DST=0 (see tzwin.py).
+
 Env (GitHub secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE (local dates), STATES, STATE_PAUSE (sec between
-          states, default 0.4), COLD_GUARD (1/0), DRY_RUN (1/0), FEED_OUT_DIR
+          states, default 0.4), COLD_GUARD (1/0), DRY_RUN (1/0), FEED_OUT_DIR,
+          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST (dry-run test flags)
 
 Deps: requirements.txt (exact pins)
 """
@@ -57,6 +79,7 @@ from shapely.prepared import prep
 from shapely.ops import unary_union
 
 import feedguard as fg
+import tzwin
 
 BANDS = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00]
 POINT_FLOOR = 0.50
@@ -123,6 +146,10 @@ MESH_IEM_URL = ("https://mtarchive.geol.iastate.edu/{y}/{m}/{d}/mrms/ncep/MESH_M
                 "MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
 MESH_AWS_URL = ("https://noaa-mrms-pds.s3.amazonaws.com/CONUS/MESH_Max_1440min_00.50/{ds}/"
                 "MRMS_MESH_Max_1440min_00.50_{ds}-{ts}.grib2.gz")
+# v4 DST days only (plan T2): hourly maxima, AWS only (IEM keeps no 60-min archive).
+MESH60_AWS_URL = ("https://noaa-mrms-pds.s3.amazonaws.com/CONUS/MESH_Max_60min_00.50/{ds}/"
+                  "MRMS_MESH_Max_60min_00.50_{ds}-{ts}.grib2.gz")
+MESH60_PARAM = 30          # MESH_Max_60min parameterNumber (1440 min = 34)
 
 # What every MESH_Max_1440min file must look like (identical 2021-10 -> 2026-10).
 MESH_INT_KEYS = {"discipline": 209, "parameterCategory": 3, "parameterNumber": 34,
@@ -194,9 +221,10 @@ def fetch_mesh_raw(anchor_utc):
     raise fg.UpstreamError(f"MESH anchor {ds}-{ts} could not be fetched: {' | '.join(notes)}")
 
 
-def decode_mesh(raw, anchor_utc):
+def decode_mesh(raw, anchor_utc, param=34):
     """Decode + validate one MESH file. Returns the mm array exactly as before
-    (np.asarray of the single message's values)."""
+    (np.asarray of the single message's values). param: GRIB parameterNumber
+    (34 = MESH_Max_1440min, the only product v3 reads; 30 = MESH_Max_60min)."""
     try:
         grib = gzip.decompress(raw)
     except Exception as e:
@@ -210,7 +238,7 @@ def decode_mesh(raw, anchor_utc):
             if g.messages != 1:
                 raise fg.ValidationError(f"MESH file has {g.messages} messages (expected 1)")
             m = g[1]
-            for k, want in MESH_INT_KEYS.items():
+            for k, want in dict(MESH_INT_KEYS, parameterNumber=param).items():
                 if int(m[k]) != want:
                     raise fg.ValidationError(f"MESH {k}={m[k]} (expected {want})")
             if m["gridType"] != "regular_ll":
@@ -492,6 +520,246 @@ def process_local_date(run, local_date, states, pause=0.4, cold_guard=True, poli
     return stored
 
 
+# ===================================================================== v4
+# DAY_CONVENTION=v4 (Archive Phase 5 Stage 3). Everything below is used only
+# when DAY_CONVENTION=v4; the v3 path above is unchanged.
+
+def round_anchor(end):
+    """The archive's 30-minute file cadence rounding of window_end_utc()."""
+    if end.minute < 15:
+        end = end.replace(minute=0)
+    elif end.minute < 45:
+        end = end.replace(minute=30)
+    else:
+        end = (end + dt.timedelta(hours=1)).replace(minute=0)
+    return end.replace(second=0, microsecond=0)
+
+
+def bbox_window(geom, margin=3):
+    """Rows/cols of the MRMS lattice covering the state's bbox (+margin cells)."""
+    minx, miny, maxx, maxy = geom.bounds
+    c0 = max(0, int((minx - GRID_WEST) / GRID_RES) - margin)
+    c1 = min(7000, int((maxx - GRID_WEST) / GRID_RES) + 1 + margin)
+    r0 = max(0, int((GRID_NORTH - maxy) / GRID_RES) - margin)
+    r1 = min(3500, int((GRID_NORTH - miny) / GRID_RES) + 1 + margin)
+    return r0, r1, c0, c1
+
+
+def cell_of(lon, lat):
+    """(row, col) of the MRMS cell whose centre is (lon, lat) (3-dp rounded)."""
+    return (int(round((GRID_NORTH - lat) / GRID_RES - 0.5)),
+            int(round((lon - GRID_WEST) / GRID_RES - 0.5)))
+
+
+def fetch_mesh60_raw(t):
+    ds, ts = t.strftime("%Y%m%d"), t.strftime("%H%M%S")
+    return fg.http_get(MESH60_AWS_URL.format(ds=ds, ts=ts), timeout=120, retries=4,
+                       what=f"MESH60 AWS {ds}-{ts}")
+
+
+def v4_needed_files(dg, g, dst_fix):
+    """[(kind, utc time)] that group g's day field needs. kind 1440 = the
+    MESH_Max_1440min anchor (ALWAYS also what v3 fetches for that window),
+    60 = MESH_Max_60min (DST transition days only)."""
+    start, end = dg.groups[g]
+    need = [("1440", round_anchor(end))]
+    hours = dg.hours(g)
+    if dst_fix and hours == 25:
+        need.append(("60", start + dt.timedelta(hours=1)))
+    elif dst_fix and hours == 23:
+        need += [("60", start + dt.timedelta(hours=k)) for k in range(0, 24)]
+    elif hours != 24 and dst_fix:
+        raise fg.ValidationError(f"unexpected {hours} h local day")
+    return need
+
+
+def v4_group_field(dg, g, files, dst_fix):
+    """MESH (mm) field of group g's local day (plan T2 on DST days)."""
+    start, end = dg.groups[g]
+    anchor = round_anchor(end)
+    f = decode_mesh(files[("1440", anchor)], anchor)
+    hours = dg.hours(g)
+    if not dst_fix or hours == 24:
+        return f
+    if hours == 25:     # 1440 file = (start+1h, end]; add the missing first hour
+        t = start + dt.timedelta(hours=1)
+        return np.fmax(f, decode_mesh(files[("60", t)], t, MESH60_PARAM))
+    # 23 h: 1440 file = (start-1h, end] includes the previous day's last hour X.
+    x = decode_mesh(files[("60", start)], start, MESH60_PARAM)
+    c = None
+    for k in range(1, 24):
+        t = start + dt.timedelta(hours=k)
+        v = decode_mesh(files[("60", t)], t, MESH60_PARAM)
+        c = v if c is None else np.fmax(c, v, out=c)
+    # where the 1440 value exceeds the extra hour it is reached inside the day:
+    # keep it (exact); else the max may come from the extra hour -> 23 hourly files
+    return np.where(f > x, f, c)
+
+
+def process_local_date_v4(run, local_date, states, pause=0.4, cold_guard=True, policy="strict",
+                          flags=None):
+    """v4: each cell's own-zone local day. Same RPCs, payload layout and order
+    as v3 (with V4_ZONES=state V4_DST=0 the payload is byte-identical to v3)."""
+    flags = flags or {"zones": "real", "dst": True}
+    real = flags["zones"] == "real"
+    date_iso = f"{local_date[:4]}-{local_date[4:6]}-{local_date[6:]}"
+    key = date_iso
+    zm = tzwin.zone_map("mrms")
+    geoms = {st: load_state_geom(st) for st in states}
+    st_zone = {st: tzwin.zone_id(STATE_TZ[st]) for st in states}
+    st_zones = {}
+    for st in states:
+        if real:
+            r0, r1, c0, c1 = bbox_window(geoms[st])
+            zs = set(np.unique(zm.zone[r0:r1, c0:c1]).tolist()) - {0}
+        else:
+            zs = set()
+        st_zones[st] = zs | {st_zone[st]}
+    dg = tzwin.DayGroups(local_date, set().union(*st_zones.values()))
+    st_group = {st: tzwin.group_of_window(dg, tzwin.local_window(STATE_TZ[st], local_date))
+                for st in states}
+    st_groups = {st: sorted({int(dg.lut[z]) for z in st_zones[st]}) for st in states}
+    anchors = {g: round_anchor(dg.groups[g][1]) for g in range(len(dg.groups))}
+    used = sorted({g for st in states for g in st_groups[st]})
+    run.day(key)["v4_groups"] = dg.describe()
+    run.expect(key, "states", len(states))
+    run.expect(key, "anchors", len({anchors[g] for g in used}))
+
+    # Every file of every group is fetched BEFORE anything is written (as v3).
+    files, missing, failed_g = {}, [], {}
+    for g in used:
+        for kind, t in v4_needed_files(dg, g, flags["dst"]):
+            if (kind, t) in files:
+                continue
+            try:
+                if kind == "1440":
+                    raw, src, notes = fetch_mesh_raw(t)
+                    if src != "IEM":
+                        run.note(key, f"anchor {t.isoformat()} read from {src} ({'; '.join(notes)})")
+                    run.receive(key, f"anchors_{src}")
+                else:
+                    raw = fetch_mesh60_raw(t)
+                    run.receive(key, "mesh60_files")
+                files[(kind, t)] = raw
+            except fg.UpstreamMissing as e:
+                missing.append(t)
+                failed_g.setdefault(g, str(e))
+            except fg.FeedError as e:
+                failed_g.setdefault(g, str(e))
+    if missing and policy == "defer" and all(
+            dt.datetime.now(UTC) - a < dt.timedelta(hours=MESH_PUBLISH_GRACE_H) for a in missing):
+        run.defer(key, f"MESH file(s) {sorted({a.strftime('%m-%d %H%MZ') for a in missing})} not "
+                       f"published yet; nothing written - the next dispatch ingests the day",
+                  pending=sorted({a.isoformat() for a in missing}))
+        return 0
+
+    def group_field(g):
+        if g in failed_g:
+            raise fg.ValidationError(failed_g[g])
+        return v4_group_field(dg, g, files, flags["dst"])
+
+    by_anchor = {}
+    for st in states:
+        by_anchor.setdefault(anchors[st_group[st]], []).append(st)
+
+    national = None
+    if real:
+        gmap = dg.lut[zm.zone]
+        comp = np.full(zm.zone.shape, -3.0)
+        for g in used:
+            try:
+                f = group_field(g)
+            except fg.FeedError as e:
+                failed_g.setdefault(g, str(e))
+                continue
+            m = gmap == g
+            comp[m] = f[m]
+            del f
+            run.receive(key, "anchors")
+        national = classify(comp)
+        del comp
+
+    stored = 0
+    for anchor, group_states in sorted(by_anchor.items()):
+        cls = inches = None
+        if not real:
+            g = st_group[group_states[0]]
+            try:
+                cls, inches = classify(group_field(g))
+                run.receive(key, "anchors")
+            except fg.FeedError as e:
+                failed_g.setdefault(g, str(e))
+        for st in group_states:
+            bad = [g for g in st_groups[st] if g in failed_g]
+            if bad:
+                run.error(key, st, f"zone window(s) {[dg.describe()[g]['zones'][0] for g in bad]} "
+                                   f"unavailable: {failed_g[bad[0]]}",
+                          details={"anchor_utc": anchor.isoformat()})
+                continue
+            try:
+                geom = geoms[st]
+                c_, i_ = national if real else (cls, inches)
+                bands = build_bands(c_, geom)
+                if not bands:
+                    run.empty(key, st)
+                    continue
+                pts = extract_points(i_, geom)
+                if not pts:
+                    run.empty(key, st)
+                    continue
+                wends = []
+                for p in pts:
+                    if real:
+                        r, c = cell_of(p["lon"], p["lat"])
+                        z = int(zm.zone[r, c])
+                        if z == 0 or dg.lut[z] == tzwin.NO_GROUP:
+                            raise fg.ValidationError(f"{st}: stored cell {p['lon']},{p['lat']} has no "
+                                                     f"US zone (zone id {z})")
+                        wends.append(anchors[int(dg.lut[z])])
+                    else:
+                        wends.append(anchor)
+                max_in = max(p["v"] for p in pts)
+                if int(date_iso[5:7]) in COLD_MONTHS and cold_guard:
+                    try:
+                        skip, why = cold_season_check(st, date_iso, anchor)
+                    except Exception as ge:
+                        skip, why = False, ""
+                        run.warn(key, f"{st}: cold-season guard could not check ({type(ge).__name__}: {ge}); day kept")
+                    if skip:
+                        print(f"  {date_iso}  {st:16s} [cold-season artifact guard] skipped: {why}")
+                        run.skip(key, "cold_guard", st)
+                        continue
+                validate_state_output(st, geom, bands, pts)
+                calls = [("ingest_swath",
+                          {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                           "p_max_in": max_in, "p_features": bands, "p_window_end": anchor.isoformat()})]
+                first = True
+                for we in sorted(set(wends)):
+                    sub = [p for p, w in zip(pts, wends) if w == we]
+                    for i in range(0, len(sub), 4000):
+                        calls.append(("ingest_points",
+                                      {"p_secret": run.secret, "p_state": st, "p_date": date_iso,
+                                       "p_points": sub[i:i+4000], "p_append": not first,
+                                       "p_window_end": we.isoformat()}))
+                        first = False
+                run.write(key, st, calls)
+                run.written(key, st)
+                stored += 1
+                other = sum(1 for w in wends if w != anchor)
+                print(f"  {date_iso}  {st:16s} max {max_in}\" ({len(bands)} band(s), "
+                      f"{len(pts)} pts, window end {anchor.isoformat()}"
+                      f"{f'; {other} pts in another zone' if other else ''})")
+                if not run.dry_run:
+                    time.sleep(pause)
+            except Exception as e:
+                run.error(key, st, f"{type(e).__name__}: {e}", details={"anchor_utc": anchor.isoformat()})
+    run.set_received(key, "states_ok", len(run.day(key)["written"]) + len(run.day(key)["empty"])
+                     + len(run.day(key)["skipped"].get("cold_guard", [])))
+    if stored == 0 and not run.day(key)["failed"]:
+        print(f"{date_iso}: no on-land hail >= {POINT_FLOOR}\" in selected state(s).")
+    return stored
+
+
 def parse_states():
     states_env = (os.environ.get("STATES") or "").strip()
     if not states_env:
@@ -508,6 +776,12 @@ def main(run):
     cold_guard = (os.environ.get("COLD_GUARD") or "1").strip() != "0"
     run.meta.update({"boundary_md5": BOUNDARY_MD5, "cold_guard": cold_guard,
                      "numpy": np.__version__, "pygrib": pygrib.__version__})
+    conv = tzwin.convention()
+    flags = tzwin.test_flags(run.dry_run) if conv == "v4" else None
+    run.meta["day_convention"] = conv
+    if conv == "v4":
+        run.meta.update({"tzwin_md5": tzwin.module_md5(), "zone_map_md5": tzwin.zone_map("mrms").md5,
+                         "v4_flags": flags})
 
     explicit = fg.requested_dates()
     dates = []
@@ -542,12 +816,16 @@ def main(run):
             print("All recent dates already ingested — nothing to do.")
     states = parse_states()
 
-    print(f"MESH ingest v3 (local-clock days): {len(dates)} date(s), {len(states)} state(s)"
-          f"{'' if cold_guard else ' [COLD_GUARD=0]'}")
+    print(f"MESH ingest {conv} ({'state-zone' if conv == 'v3' else 'own-zone'} local-clock days): "
+          f"{len(dates)} date(s), {len(states)} state(s)"
+          f"{'' if cold_guard else ' [COLD_GUARD=0]'}{f' {flags}' if flags else ''}")
     total = 0
     policy = "strict" if explicit is not None else "defer"
     for d in dates:
-        total += process_local_date(run, d, states, pause, cold_guard, policy)
+        if conv == "v4":
+            total += process_local_date_v4(run, d, states, pause, cold_guard, policy, flags)
+        else:
+            total += process_local_date(run, d, states, pause, cold_guard, policy)
 
     if not run.dry_run:
         try:
