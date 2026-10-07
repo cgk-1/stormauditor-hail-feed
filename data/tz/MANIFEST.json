@@ -1,0 +1,196 @@
+{
+ "tz_hrrr.npz": {
+  "md5_file": "a5d2b1743f03ff68fc4e427f1eb038ac",
+  "md5_zone_bytes": "f1dcc9ea706ce44f5ab6bc7e652efd51",
+  "shape": [
+   1059,
+   1799
+  ],
+  "dtype": "uint8",
+  "bytes": 21462,
+  "meta": {
+   "grid": "HRRR 3 km CONUS Lambert (wrfsfcf01)",
+   "shape": [
+    1059,
+    1799
+   ],
+   "index": "zone[j, i] aligned with pygrib m.values / m.latlons() (j=0 south row)",
+   "proj": "lcc R=6371229 lat_0=lat_1=lat_2=38.5 lon_0=262.5 Dx=Dy=3000 La1=21.138123 Lo1=237.280472 Ni=1799 Nj=1059 scanningMode=64",
+   "tzbb": "2026d",
+   "rule": "containing tzbb polygon (full res) else nearest within 1.0 deg else 0",
+   "zone_id_0": "no US zone",
+   "built": "2026-10-07",
+   "stats": {
+    "inside": 923513,
+    "nearest_fill": 191588,
+    "none": 790040,
+    "ties": 0
+   }
+  },
+  "zone_counts": {
+   "0 (none)": 790040,
+   "America/New_York": 239022,
+   "America/Detroit": 38368,
+   "America/Kentucky/Louisville": 412,
+   "America/Kentucky/Monticello": 141,
+   "America/Indiana/Indianapolis": 7656,
+   "America/Indiana/Vincennes": 495,
+   "America/Indiana/Winamac": 127,
+   "America/Indiana/Marengo": 90,
+   "America/Indiana/Petersburg": 105,
+   "America/Indiana/Vevay": 64,
+   "America/Chicago": 389925,
+   "America/Indiana/Tell_City": 115,
+   "America/Indiana/Knox": 89,
+   "America/Menominee": 1300,
+   "America/North_Dakota/Center": 212,
+   "America/North_Dakota/New_Salem": 573,
+   "America/North_Dakota/Beulah": 331,
+   "America/Denver": 205047,
+   "America/Boise": 20985,
+   "America/Phoenix": 36052,
+   "America/Los_Angeles": 173992
+  }
+ },
+ "tz_mrms.npz": {
+  "md5_file": "516f380dbbcab87eb591b83563d7c9bc",
+  "md5_zone_bytes": "e16e50b8fd7a53b6a08af01c408c1ae6",
+  "shape": [
+   3500,
+   7000
+  ],
+  "dtype": "uint8",
+  "bytes": 81872,
+  "meta": {
+   "grid": "MRMS 0.01 deg lattice (MESH_Max_1440min_00.50)",
+   "shape": [
+    3500,
+    7000
+   ],
+   "index": "zone[r, c]; lon = -130 + (c+0.5)*0.01, lat = 55 - (r+0.5)*0.01 (r=0 north; same as mesh_ingest.py extract_points)",
+   "tzbb": "2026d",
+   "rule": "containing tzbb polygon (full res) else nearest within 1.0 deg else 0",
+   "zone_id_0": "no US zone",
+   "built": "2026-10-07",
+   "stats": {
+    "inside": 8649642,
+    "nearest_fill": 1795146,
+    "none": 14055212,
+    "ties": 0
+   }
+  },
+  "zone_counts": {
+   "0 (none)": 14055212,
+   "America/New_York": 2195635,
+   "America/Detroit": 391215,
+   "America/Kentucky/Louisville": 3763,
+   "America/Kentucky/Monticello": 1267,
+   "America/Indiana/Indianapolis": 72813,
+   "America/Indiana/Vincennes": 4640,
+   "America/Indiana/Winamac": 1196,
+   "America/Indiana/Marengo": 829,
+   "America/Indiana/Petersburg": 921,
+   "America/Indiana/Vevay": 592,
+   "America/Chicago": 3559800,
+   "America/Indiana/Tell_City": 1025,
+   "America/Indiana/Knox": 864,
+   "America/Menominee": 13390,
+   "America/North_Dakota/Center": 2238,
+   "America/North_Dakota/New_Salem": 5913,
+   "America/North_Dakota/Beulah": 3428,
+   "America/Denver": 1982695,
+   "America/Boise": 209043,
+   "America/Phoenix": 311846,
+   "America/Los_Angeles": 1675364,
+   "America/Sitka": 6311
+  }
+ },
+ "tz_urma.npz": {
+  "md5_file": "39787217382959d8926e7cc53d31a05b",
+  "md5_zone_bytes": "45f7e6c47e39bdf463b8d472f306de2a",
+  "shape": [
+   1597,
+   2345
+  ],
+  "dtype": "uint8",
+  "bytes": 28693,
+  "meta": {
+   "grid": "URMA 2.5 km NDFD Lambert (urma2p5 ... grb2_wexp)",
+   "shape": [
+    1597,
+    2345
+   ],
+   "index": "zone[j, i] aligned with pygrib m.values / m.latlons() (j=0 south row)",
+   "proj": "lcc R=6371200 lat_0=lat_1=lat_2=25 lon_0=265 Dx=Dy=2539.703 La1=19.228976 Lo1=233.723448 Ni=2345 Nj=1597 scanningMode=64",
+   "tzbb": "2026d",
+   "rule": "containing tzbb polygon (full res) else nearest within 1.0 deg else 0",
+   "zone_id_0": "no US zone",
+   "built": "2026-10-07",
+   "stats": {
+    "inside": 1375987,
+    "nearest_fill": 287865,
+    "none": 2081113,
+    "ties": 0
+   }
+  },
+  "zone_counts": {
+   "0 (none)": 2081113,
+   "America/New_York": 350099,
+   "America/Detroit": 60507,
+   "America/Kentucky/Louisville": 599,
+   "America/Kentucky/Monticello": 204,
+   "America/Indiana/Indianapolis": 11472,
+   "America/Indiana/Vincennes": 742,
+   "America/Indiana/Winamac": 191,
+   "America/Indiana/Marengo": 136,
+   "America/Indiana/Petersburg": 144,
+   "America/Indiana/Vevay": 91,
+   "America/Chicago": 571810,
+   "America/Indiana/Tell_City": 160,
+   "America/Indiana/Knox": 134,
+   "America/Menominee": 2071,
+   "America/North_Dakota/Center": 340,
+   "America/North_Dakota/New_Salem": 913,
+   "America/North_Dakota/Beulah": 530,
+   "America/Denver": 311889,
+   "America/Boise": 32535,
+   "America/Phoenix": 51032,
+   "America/Los_Angeles": 263874,
+   "America/Sitka": 4379
+  }
+ },
+ "zones": [
+  "",
+  "America/New_York",
+  "America/Detroit",
+  "America/Kentucky/Louisville",
+  "America/Kentucky/Monticello",
+  "America/Indiana/Indianapolis",
+  "America/Indiana/Vincennes",
+  "America/Indiana/Winamac",
+  "America/Indiana/Marengo",
+  "America/Indiana/Petersburg",
+  "America/Indiana/Vevay",
+  "America/Chicago",
+  "America/Indiana/Tell_City",
+  "America/Indiana/Knox",
+  "America/Menominee",
+  "America/North_Dakota/Center",
+  "America/North_Dakota/New_Salem",
+  "America/North_Dakota/Beulah",
+  "America/Denver",
+  "America/Boise",
+  "America/Phoenix",
+  "America/Los_Angeles",
+  "America/Anchorage",
+  "America/Juneau",
+  "America/Sitka",
+  "America/Metlakatla",
+  "America/Yakutat",
+  "America/Nome",
+  "America/Adak",
+  "Pacific/Honolulu",
+  "America/Puerto_Rico",
+  "America/St_Thomas"
+ ]
+}
