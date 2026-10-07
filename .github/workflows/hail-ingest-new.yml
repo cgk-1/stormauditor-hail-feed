@@ -18,6 +18,9 @@ on:
       dry_run:
         description: "1 = compute everything, write nothing (payload md5 + row counts in the summary/artifact)."
         required: false
+      day_convention:
+        description: "v3 (default, empty) or v4 (Phase 5 own-zone local days; dry-run first, owner OK before any write)"
+        required: false
 
 # One run at a time; a second trigger queues behind the first (never cancels it).
 concurrency: {group: hail-ingest, cancel-in-progress: false}
@@ -42,6 +45,7 @@ jobs:
           INGEST_DATE:       ${{ github.event.inputs.date }}
           STATES:            ${{ github.event.inputs.states }}
           DRY_RUN:           ${{ github.event.inputs.dry_run }}
+          DAY_CONVENTION:    ${{ github.event.inputs.day_convention }}
           FEED_OUT_DIR:      feed-out
         run: python mesh_ingest.py
       - name: Upload run record (summary JSON, quarantine records, dry-run payloads)
