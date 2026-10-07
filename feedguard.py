@@ -63,6 +63,17 @@ class ValidationError(FeedError):
     """The input does not look the way the ingester expects."""
 
 
+class SafeRetry(FeedError):
+    """The DB call certainly did NOT commit (PostgREST 500 = the statement failed and
+    rolled back, e.g. 57014 statement timeout; 503 = not executed; connect timeout =
+    never sent), so the same chunk may be sent again. timeoutish: load/timeout class
+    (eligible for splitting) rather than a deterministic error."""
+
+    def __init__(self, msg, timeoutish):
+        super().__init__(msg)
+        self.timeoutish = timeoutish
+
+
 class AmbiguousWrite(FeedError):
     """The request may or may not have reached the database."""
 
@@ -234,6 +245,32 @@ class _FakeResponse:
         return None
 
 
+# Chunked write RPCs: (rows key, has p_append, re-sending an APPEND chunk is idempotent).
+# Verified against the DB definitions 2026-10-07: p_append=false deletes the key range then
+# inserts; p_append=true only inserts. "idempotent" = the insert is an upsert / do-nothing,
+# so an ambiguous append can be sent again; plain-insert appends cannot (duplicates), so an
+# ambiguous failure there replays the whole write unit from its first (deleting) call.
+# Anything not listed (ingest_swath counts n_bands per call, wind_swath_begin/_add, ...)
+# is never split and keeps the old retry behaviour.
+CHUNK_RPCS = {
+    "ingest_points": ("p_points", True, False),
+    "ingest_wind_points": ("p_points", True, False),
+    "hz_hrrr_ingest": ("p_points", True, True),
+    "hz_bg_coarse_ingest": ("p_points", False, True),
+    "hz_station_bg_ingest": ("p_rows", True, True),
+    "hz_station_peak_ingest": ("p_rows", False, True),
+    "hz_station_daily_ingest": ("p_rows", True, True),
+    "hz_station_daily_ingest_v4": ("p_rows", True, True),
+    "hz_lsr_ingest": ("p_rows", True, False),
+    "hz_lsr_ingest_v4": ("p_rows", True, False),
+    "hz_storm_events_ingest": ("p_rows", True, True),
+    "hz_storm_events_ingest_v4": ("p_rows", True, True),
+}
+SPLIT_MIN_ROWS = int(os.environ.get("FEED_SPLIT_MIN_ROWS") or 250)
+SAME_SIZE_TRIES = 2          # timeout-class failures at one chunk size before it is halved
+MAX_TRIES_MIN_SIZE = 4       # attempts at the smallest size (and for non-timeout errors), as before
+
+
 def _rows_in(payload):
     for k in ("p_points", "p_rows", "p_features"):
         v = payload.get(k)
@@ -373,6 +410,74 @@ class Run:
                 backoff_sleep(attempt, 1.5, 30)
         raise FeedError(last)
 
+    def _post_once(self, name, payload, timeout):
+        """One attempt, classified: SafeRetry (certainly not committed), AmbiguousWrite
+        (may have committed), FeedError (rejected: 4xx)."""
+        import requests
+        try:
+            r = requests.post(f"{self.base}/rest/v1/rpc/{name}", headers=self._headers(),
+                              data=json.dumps(payload), timeout=(20, timeout))
+        except requests.exceptions.ConnectTimeout as e:
+            raise SafeRetry(f"{name} connect timeout: {e}", timeoutish=True) from None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            raise AmbiguousWrite(f"{name}: {type(e).__name__}: {e}") from None
+        if r.status_code < 300:
+            return r
+        msg = f"{name} HTTP {r.status_code}: {r.text[:300]}"
+        if r.status_code in (400, 401, 403, 404, 409, 422):
+            raise FeedError(msg)
+        if r.status_code in (502, 504):          # gateway gave up; the statement may have run
+            raise AmbiguousWrite(msg)
+        if r.status_code == 500:
+            raise SafeRetry(msg, timeoutish="57014" in r.text)
+        raise SafeRetry(msg, timeoutish=r.status_code == 503)
+
+    def _retry_log(self, key, entry):
+        self.day(key).setdefault("retries", []).append(entry)
+        print(f"  [{entry['action']}] {key} {entry['scope']} {entry['rpc']} ({entry['rows']} rows): "
+              f"{entry.get('error', '')[:160]}", flush=True)
+
+    def _write_chunk(self, key, scope, name, payload, timeout):
+        """One chunk of a CHUNK_RPCS write. Certain failures retry the SAME chunk; after
+        SAME_SIZE_TRIES timeout-class failures the chunk is halved (first half keeps its
+        p_append, the second half appends) recursively down to SPLIT_MIN_ROWS, then fails
+        loudly. An ambiguous failure is retried only when re-sending is idempotent (a
+        deleting first chunk, or an upsert RPC); otherwise it goes up to the unit replay."""
+        rows_key, has_append, idem = CHUNK_RPCS[name]
+        rows = payload.get(rows_key) or []
+        resend_ok = idem or not has_append or payload.get("p_append") is False
+        fails = 0
+        while True:
+            try:
+                return self._post_once(name, payload, timeout)
+            except SafeRetry as e:
+                err, timeoutish = e, e.timeoutish
+            except AmbiguousWrite as e:
+                if not resend_ok:
+                    self._retry_log(key, {"scope": scope, "rpc": name, "rows": len(rows), "action": "unit-replay",
+                                          "error": str(e)})
+                    raise
+                err, timeoutish = e, True
+            fails += 1
+            if timeoutish and fails >= SAME_SIZE_TRIES and len(rows) > SPLIT_MIN_ROWS:
+                k = len(rows) // 2
+                first = dict(payload, **{rows_key: rows[:k]})
+                second = dict(payload, **{rows_key: rows[k:]})
+                if has_append:
+                    second["p_append"] = True
+                self._retry_log(key, {"scope": scope, "rpc": name, "rows": len(rows), "action": "split",
+                                      "into": [k, len(rows) - k], "after_failures": fails, "error": str(err)})
+                self._write_chunk(key, scope, name, first, timeout)
+                return self._write_chunk(key, scope, name, second, timeout)
+            if fails >= MAX_TRIES_MIN_SIZE:
+                self._retry_log(key, {"scope": scope, "rpc": name, "rows": len(rows), "action": "failed",
+                                      "attempts": fails, "error": str(err)})
+                raise FeedError(f"{name} failed after {fails} attempt(s) at {len(rows)} rows "
+                                f"(smallest chunk {SPLIT_MIN_ROWS}): {err}")
+            self._retry_log(key, {"scope": scope, "rpc": name, "rows": len(rows), "action": "retry",
+                                  "attempt": fails, "error": str(err)})
+            backoff_sleep(fails - 1, 1.5, 30)
+
     def rpc_read(self, name, payload, timeout=60):
         """Read-only RPC: runs in dry-run mode too."""
         return self._post(name, payload, timeout)
@@ -431,7 +536,8 @@ class Run:
             try:
                 r = None
                 for name, payload in calls:
-                    r = self._post(name, payload, timeout)
+                    r = (self._write_chunk(key, scope, name, payload, timeout) if name in CHUNK_RPCS
+                         else self._post(name, payload, timeout))
                 return r
             except AmbiguousWrite as e:
                 last = e
@@ -459,7 +565,8 @@ class Run:
             days.append(d)
         status = ("error" if self.errors else "warning" if self.warnings
                   else "deferred" if self.deferred else "ok")
-        return {"feed": self.feed, "status": status, "dry_run": self.dry_run,
+        retries = sum(len(d.get("retries", [])) for d in days)
+        return {"feed": self.feed, "status": status, "dry_run": self.dry_run, "write_retries": retries,
                 "started_utc": self.started.isoformat(),
                 "finished_utc": dt.datetime.now(UTC).isoformat(),
                 "git_sha": os.environ.get("GITHUB_SHA"), "run_id": os.environ.get("GITHUB_RUN_ID"),
