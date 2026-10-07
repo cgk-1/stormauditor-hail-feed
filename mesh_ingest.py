@@ -61,10 +61,18 @@ DAY_CONVENTION=v4 (Archive Phase 5 Stage 3, 2026-10-07; default v3 = unchanged):
     only (~53 KB each; IEM does not archive them). Missing file = the day fails.
   * Test flags (DRY_RUN only): V4_ZONES=state, V4_DST=0 (see tzwin.py).
 
+STAGE 4 (owner-approved 2026-10-07): the workflow passes DAY_CONVENTION=v4 on
+every schedule/dispatch unless a dispatch sets day_convention=v3 (the code's
+own default stays v3, so local runs without the variable are unchanged).
+Explicit-date runs end each fully successful day with the clear-step
+(clearstep.py, RPC hz_day_clear_states_v2): states of the run's scope that were
+not re-supplied lose their stale hail_days/hail_polygons/hail_points rows.
+CLEAR_STEP=0 turns it off; DRY_RUN only reports what it would clear.
+
 Env (GitHub secrets): SUPABASE_URL, SUPABASE_ANON_KEY, INGEST_SECRET
 Optional: DATE / INGEST_DATE (local dates), STATES, STATE_PAUSE (sec between
           states, default 0.4), COLD_GUARD (1/0), DRY_RUN (1/0), FEED_OUT_DIR,
-          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST (dry-run test flags)
+          DAY_CONVENTION (v3|v4), V4_ZONES / V4_DST (dry-run test flags), CLEAR_STEP (1/0)
 
 Deps: requirements.txt (exact pins)
 """
@@ -78,6 +86,7 @@ from shapely.geometry import shape, mapping, Point, MultiPolygon, Polygon
 from shapely.prepared import prep
 from shapely.ops import unary_union
 
+import clearstep
 import feedguard as fg
 import tzwin
 
@@ -830,6 +839,12 @@ def main(run):
             total += process_local_date_v4(run, d, states, pause, cold_guard, policy, flags)
         else:
             total += process_local_date(run, d, states, pause, cold_guard, policy)
+        # Stage 4 clear-step (explicit-date runs only, fully successful days only):
+        # states of this run's scope that were NOT re-supplied lose their stale
+        # hail_days / hail_polygons / hail_points rows (clearstep.py).
+        key = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        clearstep.after_day(run, key, "HAIL", states, run.day(key)["written"],
+                            explicit=explicit is not None)
 
     if not run.dry_run:
         try:
