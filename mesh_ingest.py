@@ -662,22 +662,26 @@ def process_local_date_v4(run, local_date, states, pause=0.4, cold_guard=True, p
     for st in states:
         by_anchor.setdefault(anchors[st_group[st]], []).append(st)
 
-    national = None
+    # Real zones: one national composite per STATE window group: every cell takes
+    # its own zone's field; cells with no US zone (> 1 deg from US land and
+    # waters, never stored) keep the state's own window (= v3), so the pixel
+    # union / clip / simplify of a one-zone state is byte-identical to v3.
+    gfields, composites = {}, {}
     if real:
         gmap = dg.lut[zm.zone]
-        comp = np.full(zm.zone.shape, -3.0)
         for g in used:
             try:
-                f = group_field(g)
+                gfields[g] = group_field(g)
+                run.receive(key, "anchors")
             except fg.FeedError as e:
                 failed_g.setdefault(g, str(e))
-                continue
-            m = gmap == g
-            comp[m] = f[m]
-            del f
-            run.receive(key, "anchors")
-        national = classify(comp)
-        del comp
+
+    def national(g_state):
+        if g_state not in composites:
+            comp = tzwin.compose(gmap, gfields, gfields[g_state])
+            composites[g_state] = classify(comp)
+            del comp
+        return composites[g_state]
 
     stored = 0
     for anchor, group_states in sorted(by_anchor.items()):
@@ -698,7 +702,7 @@ def process_local_date_v4(run, local_date, states, pause=0.4, cold_guard=True, p
                 continue
             try:
                 geom = geoms[st]
-                c_, i_ = national if real else (cls, inches)
+                c_, i_ = national(st_group[st]) if real else (cls, inches)
                 bands = build_bands(c_, geom)
                 if not bands:
                     run.empty(key, st)
